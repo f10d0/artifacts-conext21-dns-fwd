@@ -1,0 +1,5 @@
+# the interface you will be using 
+interface="eth0"
+# your node ip (the one of your iface)
+node_ip="192.168.0.2"
+dns_request_complete="A,rr-mirror.research.nawrocki.berlin"
