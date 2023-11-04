@@ -1,4 +1,4 @@
-# Artifacts - Transparent DNS Forwarders
+# Transparent DNS Forwarders
 
 This repository contains the artifacts for the following paper:
 
@@ -6,6 +6,8 @@ This repository contains the artifacts for the following paper:
     Marcin Nawrocki, Maynard Koch, Thomas C. Schmidt, Matthias Wählisch.
     CoNEXT ’21, December 6–10, 2021, Virtual Event, USA.
     https://doi.org/10.1145/3485983.3494872
+
+and code of the IETF 118 Hackathon.
 
 ## Structure
 
