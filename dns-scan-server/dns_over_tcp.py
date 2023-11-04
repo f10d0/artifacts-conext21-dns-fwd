@@ -17,8 +17,6 @@ from queue import Queue
 import random
 # to load config.ini file
 import configparser as cp
-# threading module for multitasking
-import threading
 # add some colors for output
 from colorama import Fore
 from colorama import Style
@@ -41,7 +39,7 @@ import hashlib
 # of DNS (DNS over TCP, DNS over Http etc.)
 # this may not be trivial so at first we only
 # implement DNS over TCP
-class DNS_Over_X:
+class DNS_Over_TCP:
     def __init__(self,debug):
         # turn debugging print statements on or off
         self.__debug = debug
@@ -58,8 +56,7 @@ class DNS_Over_X:
         self.__bpf_filter += f"and dst portrange {self.__config['portrange_min']}-{self.__config['portrange_max']}"
         #print(self.__bpf_filter)
         # list of free ports
-        self.__freeports = [61000] #[i for i in range(int(self.__config['portrange_min']),int(self.__config['portrange_max']))]
-        self.__port_sem = threading.Semaphore(value=len(self.__freeports))
+        self.__ports = [i for i in range(int(self.__config['portrange_min']),int(self.__config['portrange_max']))]
         # temporary scan data (dictionary with port number as key
         # structure:
         # port:[ ( id, timestamp, IP-Adr., Dest. Port, TCP Seqnum, TCP Acknum, TCP Flags, DNS A Records ),... ]
@@ -72,11 +69,10 @@ class DNS_Over_X:
         self.__scan_thread = Thread(target = self.init_tcp_connections)
         self.__sniffer_thread = Thread(target = self.sniffer)
         self.__process_thread = Thread(target = self.process_responses_thread)
-        self.__timeout_thread = Thread(target = self.timeout_thread)
         self.__writeback_thread = Thread(target = self.writeback_thread)
         # make sure to start sniffer thread first
         self.__running_threads = [self.__sniffer_thread, self.__scan_thread, 
-                self.__process_thread, self.__timeout_thread,
+                self.__process_thread,
                 self.__writeback_thread]
         self.DNS_PAYLOAD_SIZE = len(DNS(rd=1, id=0, qd=DNSQR(qname=self.__config["qry_name"]))) +2
 
@@ -99,27 +95,13 @@ class DNS_Over_X:
         if self.__debug:
             print(f"{my_colors.INFO}[*] Loading IP Adresses Done.")
             print(f"[*] Head: {self.__ip_list[:5]}{my_colors.END}")
-    
-    def get_free_port(self):
-        # pick random free port
-        #self.__port_sem.acquire()
-        #port = random.choice(self.__freeports)
-        # remove it from free port list
-        #self.__freeports.remove(port)
-        return 61000 #port
 
     def init_tcp_connections(self):
         # main thread which goes through all ip's in ip list
         # and sends syn packets
         for i in tqdm(range(len(self.__ip_list))):
             print("lets go: ",i)
-            # if free port list is empty -> wait until a port is free again
-            #while len(self.__freeports)==0:
-                #print("waiting for port")
-                #sleep(1)
-            #    pass
-            # free port(s) available
-            port = self.get_free_port()
+            port = random.choice(self.__ports)
             # get random ip
             ip = self.get_next_ip()
             # get random (unused) seq_num
@@ -131,7 +113,7 @@ class DNS_Over_X:
             # adding seq, seq to history is initially important -> it is seq and ack at the same time
             # to prevent failing to match the next packets as we compare seq with ack
             while (port,seq) in self.__scan_data:
-                seq = (int.from_bytes(hashlib.sha256(ip.encode("utf-8")).digest()[:2], 'little')+42)* 1000
+                seq = (int.from_bytes(hashlib.sha256(ip.encode("utf-8")).digest()[:2], 'little')+42) * 1000
             self.__scan_data[(port,seq)] = [(i,datetime.utcnow(),ip,port,seq,seq,"S","")]
             # send syn packet to ip
             self.send_syn_packet(ip,port,seq)
@@ -310,25 +292,15 @@ class DNS_Over_X:
         # empty data history
         self.__scan_data[scankey] = None
 
-    def timeout_thread(self):
-        while not self.__all_pkts_sent:
-            # go through current data log and watch for missing answers
-            # detected bydifference of last arrived packet till now
-            for scankey in self.__scan_data.keys():
-                timestamp = datetime.utcnow()
-                data = self.__scan_data[scankey]
-                if data:
-                    #if self.__debug:
-                    #    print(f"[*] Current Scan Data:\n->{port=}\n->{data=}")
-                    # data[-1][0] contains most recent timestamp
-                    timedelta = timestamp - data[-1][1]
-                    # timeout after 10 seconds (arbitrary!)
-                    if timedelta.total_seconds() > 10:
-                        if self.__debug:
-                            print(f"{my_colors.ERROR}[*] Timeout on {scankey=}.{my_colors.END}")
-                        self.__writeback.put(scankey)
-        print(f"{my_colors.INFO}[*] Timeout Thread is done.{my_colors.END}")
-        return
+    def timeout(self):
+        # go through current data log and watch for missing answers
+        # detected bydifference of last arrived packet till now
+        for scankey in self.__scan_data.keys():
+            data = self.__scan_data[scankey]
+            if data:
+                if self.__debug:
+                    print(f"{my_colors.ERROR}[*] Timeout on {scankey=}.{my_colors.END}")
+                self.__writeback.put(scankey)
 
     def send_ack_or_fin_packet(self, target_ip, src_port, seq_num, ack_num, flags, payload_length = 1):
         ip = IP(src=self.__config["ip_client"], dst=target_ip, ttl=int(self.__config["ttl"]))
@@ -365,13 +337,14 @@ class DNS_Over_X:
         # end all running threads
         for thread in self.__running_threads:
             thread.join()
+        self.timeout()
 
 
 if __name__ == "__main__":
     # configure ip tables to stop network stack to automatically send RST packets
     os.system("sudo iptables -C OUTPUT -p tcp --tcp-flags RST RST -j DROP > /dev/null || sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP")
 
-    measurement = DNS_Over_X(True)
+    measurement = DNS_Over_TCP(True)
     ip_addr_file = argv[1]
     measurement.set_ip_list(ip_addr_file)
     measurement.start_scanning()
