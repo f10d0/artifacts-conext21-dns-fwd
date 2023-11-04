@@ -154,16 +154,19 @@ class DNS_Over_TCP:
     def init_tcp_connections(self):
         # main thread which goes through all ip's in ip list
         # and sends syn packets
-        suffix=8
-        ipaddr = ip2long("141.30.1.0")
-        for i in tqdm(random_range(2**suffix)):
-            newip = ipaddr + i
-            strip = socket.inet_ntoa(struct.pack('!L', newip))
-        #for i in tqdm(range(len(self.__ip_list))):
-            logging.info(f"cur ip: {strip}")
+        #suffix=8
+        #ipaddr = ip2long("141.30.1.0")
+        #for i in tqdm(random_range(2**suffix)):
+        #    newip = ipaddr + i
+        #    strip = socket.inet_ntoa(struct.pack('!L', newip))
+        count = 0
+        MAX_PKTS = 20000
+        syn_pkts_buf = []
+        for i in tqdm(range(len(self.__ip_list))):
+        #    logging.info(f"cur ip: {strip}")
             port = random.choice(self.__ports)
             # get random ip
-            ip = strip #self.get_next_ip()
+            ip = self.__ip_list[i] #self.get_next_ip()
             # get random (unused) seq_num
             seq = int.from_bytes(hashlib.sha256(ip.encode("utf-8")).digest()[:2], 'little') * 1000
             if self.__debug:
@@ -176,9 +179,14 @@ class DNS_Over_TCP:
                 seq = (int.from_bytes(hashlib.sha256(ip.encode("utf-8")).digest()[:2], 'little')+42) * 1000
             self.__scan_data[(port,seq)] = [(i,datetime.utcnow(),ip,port,seq,seq,"S","")]
             # send syn packet to ip
-            self.send_syn_packet(ip,port,seq)
+            #self.send_syn_packet(ip,port,seq)
+            syn_pkts_buf.append(self.build_syn_packet(ip,port,seq))
             logging.info("sending done.")
-        #self.stop_threads()
+            if count > MAX_PKTS:
+                sendp(syn_pkts_buf, iface=self.__config["iface"])
+                count = 0
+            count = count +1
+        sendp(syn_pkts_buf, iface=self.__config["iface"])
         logging.info(f"{my_colors.INFO}[*] Sending SYN Packets Done.{my_colors.END}")
         sleep(15)
         logging.info(f"{my_colors.INFO}[*] Slowly Shutting Down Scan/Capture Process.{my_colors.END}")
@@ -374,6 +382,11 @@ class DNS_Over_TCP:
         logging.info("built packet")
         s.send(syn)
         logging.info("sending is done!")
+
+    def build_syn_packet(self, target_ip, src_port, seq_num):
+        ip = IP(src=self.__config["ip_client"], dst=target_ip, ttl=int(self.__config["ttl"]))
+        syn = Ether()/ip/TCP(sport=src_port, dport=int(self.__config["dst_port"]), flags="S",seq=seq_num)
+        return syn
 
     def send_ack_with_dns(self, target_ip, src_port, seq_num, ack_num):
         ip = IP(src=self.__config["ip_client"], dst=target_ip, ttl=int(self.__config["ttl"]))
