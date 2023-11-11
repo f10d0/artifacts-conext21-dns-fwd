@@ -100,7 +100,7 @@ def random_range(start, stop=None, step=None):
 # this may not be trivial so at first we only
 # implement DNS over TCP
 class DNS_Over_TCP:
-    def __init__(self, debug: bool, id_prefix: str):
+    def __init__(self, debug: bool, process_id: int):
         self.__logger = logging.getLogger("dns_over_tcp")
         if debug:
             self.__logger.setLevel(logging.DEBUG)
@@ -114,17 +114,26 @@ class DNS_Over_TCP:
         self.__all_pkts_sent = False
         # read config.ini file (DEFAULT section)
         self.__config = self.read_config(file = "config.ini",section="DEFAULT")
+        # split port range
+        if id != 0:
+            port_min = int(self.__config['portrange_min'])
+            port_max = int(self.__config['portrange_max'])
+            num_processes = int(self.__config['processes'])
+            per_process_r = int((port_max - port_min)/num_processes)
+            self.__port_min = port_min + per_process_r*(process_id-1)
+            self.__port_max = self.__port_min + per_process_r if self.__port_min + per_process_r < port_max else port_max
+        else:
+            self.__port_min = int(self.__config['portrange_min'])
+            self.__port_max = int(self.__config['portrange_max'])
         # init bpf filter after loading config
         # sniff only on incoming pkts within portrange
         self.__bpf = f"tcp and ip dst {self.__config['ip_client']} "
         self.__bpf += f"and src port {self.__config['dst_port']} "
-        self.__bpf += f"and dst portrange {self.__config['portrange_min']}-{self.__config['portrange_max']}"
-        self.__logger.debug(f"berkeley packet filter: {str(self.__bpf)}")
+        self.__bpf += f"and dst portrange {str(self.__port_min)}-{str(self.__port_max)}"
         # list of free ports
-        self.__ports = [i for i in range(int(self.__config['portrange_min']),int(self.__config['portrange_max']))]
-        self.__logger.info(f"port range: {self.__config['portrange_min']} - {self.__config['portrange_min']}")
+        self.__ports = [i for i in range(self.__port_min,self.__port_max)]
         # prefix for the id in scan_data
-        self.__id_prefix = id_prefix
+        self.__process_id = process_id
         # temporary scan data (dictionary with port number and sequence number as key
         # structure: (port, seq_num):[ ( id, timestamp, IP-Adr., Dest. Port, TCP Seqnum, TCP Acknum, TCP Flags, DNS A Records ),... ]
         self.__scan_data = {}
@@ -146,6 +155,8 @@ class DNS_Over_TCP:
         self.MAX_PKTS = int(self.__config["syn_pkt_buf_size"])
 
     def start_scanning(self):
+        self.__logger.info(f"port range: {str(self.__port_min)} - {str(self.__port_max)}")
+        self.__logger.debug(f"berkeley packet filter: {str(self.__bpf)}")
         self.__logger.info(f"{my_colors.INFO}[*] Starting Scan.{my_colors.END}")
         for thread in self.__running_threads:
             thread.start()
@@ -201,14 +212,14 @@ class DNS_Over_TCP:
                   and (port,seq-1-self.DNS_PAYLOAD_SIZE) in self.__scan_data \
                   and (port,seq-2-self.DNS_PAYLOAD_SIZE) in self.__scan_data:
                 seq = seq + 42
-            self.__scan_data[(port,seq)] = [(self.__id_prefix+str(lc),datetime.utcnow(),ip,port,seq,seq,"S","")]
+            self.__scan_data[(port,seq)] = [(str(self.__process_id)+"_"+str(lc),datetime.utcnow(),ip,port,seq,seq,"S","")]
             # build syn packet buffer
             syn_pkts_buf.append(self.build_syn_packet(ip,port,seq))
             if len(syn_pkts_buf) > self.MAX_PKTS:
-                self.__logger.info(f"filling buffer took:{time.time()-start_t1}")
+                self.__logger.debug(f"filling buffer took:{time.time()-start_t1}")
                 start_t2 = time.time()
                 sendp(syn_pkts_buf, iface=self.__config["iface"], verbose=False)
-                self.__logger.info(f"send took:{time.time()-start_t2}")
+                self.__logger.debug(f"send took:{time.time()-start_t2}")
                 syn_pkts_buf = []
                 start_t1 = time.time()
             lc = lc+1
@@ -421,10 +432,10 @@ if __name__ == "__main__":
         exit(1)
 
     if len(argv) > 2:
-        id_prefix = argv[2]+"_"
+        process_id = argv[2]
     else:
-        id_prefix = ""
-    measurement = DNS_Over_TCP(debug=False, id_prefix=id_prefix)
+        process_id = 0
+    measurement = DNS_Over_TCP(debug=False, process_id=int(process_id))
     pos_cidr_ip = argv[1].split('/')
     if '/' in argv[1] and len(pos_cidr_ip) == 2 and valid_ip(pos_cidr_ip[0]):
         logging.info("running in cidr mode")
