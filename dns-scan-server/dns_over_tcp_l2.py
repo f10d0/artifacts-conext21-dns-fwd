@@ -154,6 +154,9 @@ class DNS_Over_TCP:
         self.__s2 = conf.L2socket(iface=self.__config["iface"]) # reuse L2 socket, this will speedup scapy by a lot
         self.__s3 = conf.L3socket() # reuse the same L3 socket
 
+        self.__ip_pkt = IP(src=self.__config["ip_client"], dst="0.0.0.0", ttl=int(self.__config["ttl"]))
+        self.__tcp_syn_pkt = TCP(sport=0, dport=int(self.__config["dst_port"]), flags="S",seq=0)
+
     def start_scanning(self):
         self.__logger.info(f"port range: {str(self.__port_min)} - {str(self.__port_max)}")
         self.__logger.debug(f"berkeley packet filter: {str(self.__bpf)}")
@@ -209,7 +212,7 @@ class DNS_Over_TCP:
                 seq = seq + 42
             self.__scan_data[(port,seq)] = [(str(self.__process_id)+"_"+str(lc),datetime.utcnow(),ip,port,seq,seq,"S","")]
             lc = lc+1
-            self.send_syn_packet(ip, port,seq)
+            self.send_syn_packet(ip, port, seq)
         self.__logger.info(f"{my_colors.INFO}[*] Sending SYN Packets Done.{my_colors.END}")
         sleep(15)
         self.__logger.info(f"{my_colors.INFO}[*] Slowly Shutting Down Scan/Capture Process.{my_colors.END}")
@@ -387,9 +390,16 @@ class DNS_Over_TCP:
         ack = ip/TCP(sport=src_port,dport=int(self.__config["dst_port"]),flags=flags,seq=ack_num,ack = seq_num+payload_length)
         self.__s3.send(ack)
 
-    def send_syn_packet(self,target_ip, src_port, seq_num):
-        ip = IP(src=self.__config["ip_client"], dst=target_ip, ttl=int(self.__config["ttl"]))
-        syn = self.__ether/ip/TCP(sport=src_port, dport=int(self.__config["dst_port"]), flags="S",seq=seq_num)
+    def send_syn_packet(self, target_ip, src_port, seq_num):
+        ip = self.__ip_pkt
+        ip.dst = target_ip
+        tcp = self.__tcp_syn_pkt
+        tcp.sport = src_port
+        tcp.seq = seq_num
+        syn = self.__ether.copy()
+        ip_clone = ip.copy()
+        ip_clone.add_payload(tcp.copy())
+        syn.add_payload(ip_clone)
         self.__s2.send(syn)
 
     def send_ack_with_dns(self, target_ip, src_port, seq_num, ack_num):
