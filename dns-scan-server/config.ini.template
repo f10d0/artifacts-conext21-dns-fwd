@@ -1,11 +1,13 @@
 [DEFAULT]
-iface = wlp1s0
-ip_client = 31.133.136.183
+processes=8
+iface = <youriface>
+ip_client = <yourip>
 qry_name = rr-mirror.research.nawrocki.berlin
 ttl = 60
-portrange_min = 10000
-portrange_max = 65500
+portrange_min = 61000
+portrange_max = 62000
 dst_port = 53
 log_file = scan_results.csv
 tls_port = 853
 https_port = 443
+syn_pkt_buf_size = 700
