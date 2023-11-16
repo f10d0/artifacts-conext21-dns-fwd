@@ -30,6 +30,7 @@ import logging
 
 ###############################################################################
 
+conf.use_pcap = True
 conf.layers.filter([Ether, IP, TCP, DNS, DNSQR, DNSRR])
 conf.layers.unfilter()
 
@@ -142,7 +143,9 @@ class DNS_Over_TCP:
         self.__writeback = Queue()
 
         self.__scan_thread = Thread(target = self.init_tcp_connections)
-        self.__sniffer_thread = Thread(target = self.sniffer)
+        self.__sniffer_thread = AsyncSniffer(iface=self.__config["iface"],filter=self.__bpf,store=False,
+               prn = self.capture_packets, stop_filter = lambda _: self.__all_pkts_sent)
+        #Thread(target = self.sniffer)
         self.__process_thread = Thread(target = self.process_responses_thread)
         self.__writeback_thread = Thread(target = self.writeback_thread)
         # make sure to start sniffer thread first
