@@ -48,25 +48,6 @@ type TCP_flags struct {
 	FIN, SYN, RST, PSH, ACK bool
 }
 
-func (flags_a *TCP_flags) equals(flags_b *TCP_flags) bool {
-	if flags_a.FIN != flags_b.FIN {
-		return false
-	}
-	if flags_a.SYN != flags_b.SYN {
-		return false
-	}
-	if flags_a.RST != flags_b.RST {
-		return false
-	}
-	if flags_a.PSH != flags_b.PSH {
-		return false
-	}
-	if flags_a.ACK != flags_b.ACK {
-		return false
-	}
-	return true
-}
-
 const (
 	DNS_PAYLOAD_SIZE uint16 = 54
 	ip_filepath      string = "test_ip1"
@@ -74,15 +55,23 @@ const (
 
 // this struct contains all relevant data to track the tcp connection
 type scan_data_item struct {
-	id        uint64
-	ts        int64
-	ip        net.IP
-	port      layers.TCPPort
-	seq       uint32
-	ack       uint32
-	flags     TCP_flags
-	dns_recs  []net.IP
-	following *scan_data_item
+	id       uint64
+	ts       int64
+	ip       net.IP
+	port     layers.TCPPort
+	seq      uint32
+	ack      uint32
+	flags    TCP_flags
+	dns_recs []net.IP
+	next     *scan_data_item
+}
+
+func (item *scan_data_item) last() *scan_data_item {
+	if item.next == nil {
+		return item
+	} else {
+		return item.last()
+	}
 }
 
 // key for the map below
@@ -100,7 +89,7 @@ type root_scan_data struct {
 var scan_data root_scan_data
 
 // check whether a map entry with the provided sequence number and tcp port already exists
-func (cur_scan_data *root_scan_data) contains(seq uint32, port layers.TCPPort) bool {
+func (cur_scan_data *root_scan_data) contains(port layers.TCPPort, seq uint32) bool {
 	_, ok := cur_scan_data.items[scan_item_key{port, seq}]
 	if ok {
 		return true
@@ -108,9 +97,174 @@ func (cur_scan_data *root_scan_data) contains(seq uint32, port layers.TCPPort) b
 	return false
 }
 
+var opts gopacket.SerializeOptions = gopacket.SerializeOptions{
+	ComputeChecksums: true,
+	FixLengths:       true,
+}
+
+func send_tcp_pkt(ip layers.IPv4, tcp layers.TCP, payload []byte) {
+	ip_head_buf := gopacket.NewSerializeBuffer()
+	err := ip.SerializeTo(ip_head_buf, opts)
+	if err != nil {
+		panic(err)
+	}
+	ip_head, err := ipv4.ParseHeader(ip_head_buf.Bytes())
+	if err != nil {
+		panic(err)
+	}
+
+	tcp_buf := gopacket.NewSerializeBuffer()
+	err = gopacket.SerializeLayers(tcp_buf, opts, &tcp, gopacket.Payload(payload))
+	if err != nil {
+		panic(err)
+	}
+
+	if err = raw_con.WriteTo(ip_head, tcp_buf.Bytes(), nil); err != nil {
+		panic(err)
+	}
+}
+
+func send_tcp_pkt_dns(ip layers.IPv4, tcp layers.TCP, dns layers.DNS) {
+	ip_head_buf := gopacket.NewSerializeBuffer()
+	err := ip.SerializeTo(ip_head_buf, opts)
+	if err != nil {
+		panic(err)
+	}
+	ip_head, err := ipv4.ParseHeader(ip_head_buf.Bytes())
+	if err != nil {
+		panic(err)
+	}
+
+	tcp_buf := gopacket.NewSerializeBuffer()
+	err = gopacket.SerializeLayers(tcp_buf, opts, &tcp, &dns)
+	if err != nil {
+		panic(err)
+	}
+
+	if err = raw_con.WriteTo(ip_head, tcp_buf.Bytes(), nil); err != nil {
+		panic(err)
+	}
+}
+
+func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, ack_num uint32) {
+	// === build packet ===
+	// Create ip layer
+	ip := layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		SrcIP:    net.ParseIP(cfg.Iface_ip),
+		DstIP:    dst_ip,
+		Protocol: layers.IPProtocolTCP,
+	}
+
+	// Create tcp layer
+	tcp := layers.TCP{
+		SrcPort: src_port,
+		DstPort: layers.TCPPort(cfg.Dst_port),
+		ACK:     true,
+		PSH:     true,
+		Seq:     ack_num,
+		Ack:     seq_num + 1,
+		Window:  512,
+	}
+	tcp.SetNetworkLayerForChecksum(&ip)
+
+	qst := layers.DNSQuestion{
+		Name:  []byte(cfg.Dns_query + "."),
+		Type:  layers.DNSTypeA,
+		Class: layers.DNSClassIN,
+	}
+
+	// create dns layers
+	dns := layers.DNS{
+		/*BaseLayer:    layers.BaseLayer{},
+		ID:           0, //TODO RNG
+		QR:           false,
+		OpCode:       0,
+		AA:           false,
+		TC:           false,
+		RD:           true,
+		RA:           true,
+		Z:            0,
+		ResponseCode: 0,
+		QDCount:      1,
+		ANCount:      1,
+		NSCount:      0,
+		ARCount:      0,
+		Questions:    []layers.DNSQuestion{qst},*/
+		Questions: []layers.DNSQuestion{qst},
+		RD:        true,
+		QDCount:   1,
+		OpCode:    layers.DNSOpCodeQuery,
+		ANCount:   1,
+		QR:        false,
+	}
+
+	dns_buf := gopacket.NewSerializeBuffer()
+	gopacket.SerializeLayers(dns_buf, opts, &dns)
+	//send_tcp_pkt(ip, tcp, dns_buf.Bytes())
+	send_tcp_pkt_dns(ip, tcp, dns)
+}
+
 func handle_pkt(pkt gopacket.Packet) {
 	log.Println(pkt)
 
+	ip_layer := pkt.Layer(layers.LayerTypeIPv4)
+	ip, ok := ip_layer.(*layers.IPv4)
+	if !ok {
+		return
+	}
+
+	tcp_layer := pkt.Layer(layers.LayerTypeTCP)
+	if tcp_layer != nil {
+		if pkt.ApplicationLayer() == nil {
+			tcp, ok := tcp_layer.(*layers.TCP)
+			if !ok { // skip wrong packets
+				return
+			}
+			// SYN-ACK
+			if tcp.SYN && tcp.ACK {
+				log.Println("received SYN-ACK")
+				// check if item in map
+				if !scan_data.contains(tcp.DstPort, tcp.Ack-1) {
+					return
+				}
+				root_data_item, _ := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 1}]
+				last_data_item := root_data_item.last()
+				data := scan_data_item{
+					id:   last_data_item.id,
+					ts:   time.Now().Unix(),
+					port: tcp.DstPort,
+					seq:  tcp.Seq,
+					ack:  tcp.Ack,
+					ip:   ip.SrcIP,
+					flags: TCP_flags{
+						FIN: tcp.FIN,
+						SYN: tcp.SYN,
+						RST: tcp.RST,
+						PSH: tcp.PSH,
+						ACK: tcp.ACK,
+					},
+				}
+				last_data_item.next = &data
+				send_ack_with_dns(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack)
+			} else
+			// PSH-ACK == DNS Response
+			if tcp.PSH && tcp.ACK {
+				log.Println("received PSH-ACK")
+				// decode as DNS Packet
+				dns_layer := pkt.Layer(layers.LayerTypeDNS)
+				if dns_layer != nil {
+					log.Println("got DNS response")
+					dns, ok := dns_layer.(*layers.DNS)
+					if !ok {
+						return
+					}
+					log.Println(dns.Answers)
+				}
+			}
+		}
+	}
 }
 
 func packet_capture(handle *pcapgo.EthernetHandle) {
@@ -139,7 +293,7 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 	log.Println(dst_ip, "seq_num=", seq)
 	// check for sequence number collisions
 	scan_data.mu.Lock()
-	for scan_data.contains(seq, port) {
+	for scan_data.contains(port, seq) {
 		seq += 420
 	}
 	s_d_item := scan_data_item{
@@ -156,8 +310,8 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 			PSH: false,
 			SYN: true,
 		},
-		dns_recs:  nil,
-		following: nil,
+		dns_recs: nil,
+		next:     nil,
 	}
 	log.Println("scan_data=", s_d_item)
 	scan_data.items[scan_item_key{port, seq}] = s_d_item
@@ -183,55 +337,7 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 	}
 	tcp.SetNetworkLayerForChecksum(&ip)
 
-	// qst := layers.DNSQuestion{
-	//     Name:  []byte{'w', 'w', 'w', '.', 'g', 'o', 'o', 'g', 'l', 'e', '.', 'c', 'o', 'm', '.'},
-	//     Type:  layers.DNSTypeCNAME,
-	//     Class: layers.DNSClassIN,
-	// }
-
-	// dns := layers.DNS{
-	//     BaseLayer:    layers.BaseLayer{},
-	//     ID:           0,
-	//     QR:           true,
-	//     OpCode:       0,
-	//     AA:           false,
-	//     TC:           false,
-	//     RD:           true,
-	//     RA:           true,
-	//     Z:            0,
-	//     ResponseCode: 0,
-	//     QDCount:      1,
-	//     ANCount:      1,
-	//     NSCount:      0,
-	//     ARCount:      0,
-	//     Questions:    []layers.DNSQuestion{qst},
-	// }
-
-	opts := gopacket.SerializeOptions{
-		ComputeChecksums: true,
-		FixLengths:       true,
-	}
-
-	ip_head_buf := gopacket.NewSerializeBuffer()
-	err := ip.SerializeTo(ip_head_buf, opts)
-	if err != nil {
-		panic(err)
-	}
-	ip_head, err := ipv4.ParseHeader(ip_head_buf.Bytes())
-	if err != nil {
-		panic(err)
-	}
-
-	tcp_buf := gopacket.NewSerializeBuffer()
-	//payload := gopacket.Payload([]byte("meowmeowmeow"))
-	err = gopacket.SerializeLayers(tcp_buf, opts, &tcp) //, payload)
-	if err != nil {
-		panic(err)
-	}
-
-	if err = raw_con.WriteTo(ip_head, tcp_buf.Bytes(), nil); err != nil {
-		panic(err)
-	}
+	send_tcp_pkt(ip, tcp, nil)
 }
 
 type u64id struct {
