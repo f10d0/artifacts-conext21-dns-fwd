@@ -3,9 +3,9 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -15,6 +15,7 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 	"github.com/google/gopacket/pcapgo"
+	"github.com/ilyakaznacheev/cleanenv"
 
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
@@ -22,13 +23,17 @@ import (
 	"github.com/breml/bpfutils"
 )
 
-const (
-	iface_name       string         = "wlp1s0"
-	iface_ip         string         = "192.168.69.204"
-	dst_port         layers.TCPPort = 53
-	DNS_PAYLOAD_SIZE uint16         = 54
-	ip_filepath      string         = "test_ip1"
-)
+// config
+type cfg_db struct {
+	Iface_name string `yaml:"iface_name"`
+	Iface_ip   string `yaml:"iface_ip"`
+	Dst_port   uint16 `yaml:"dst_port"`
+	Port_min   uint16 `yaml:"port_min"`
+	Port_max   uint16 `yaml:"port_max"`
+	Dns_query  string `yaml:"dns_query"`
+}
+
+var cfg cfg_db
 
 var wg sync.WaitGroup
 var raw_con *ipv4.RawConn
@@ -38,10 +43,36 @@ type stop struct{}
 var stop_chan = make(chan stop) // (〃・ω・〃)
 var ip_chan = make(chan net.IP, 1024)
 
+// a simple struct for all the tcp flags needed
 type TCP_flags struct {
 	FIN, SYN, RST, PSH, ACK bool
 }
 
+func (flags_a *TCP_flags) equals(flags_b *TCP_flags) bool {
+	if flags_a.FIN != flags_b.FIN {
+		return false
+	}
+	if flags_a.SYN != flags_b.SYN {
+		return false
+	}
+	if flags_a.RST != flags_b.RST {
+		return false
+	}
+	if flags_a.PSH != flags_b.PSH {
+		return false
+	}
+	if flags_a.ACK != flags_b.ACK {
+		return false
+	}
+	return true
+}
+
+const (
+	DNS_PAYLOAD_SIZE uint16 = 54
+	ip_filepath      string = "test_ip1"
+)
+
+// this struct contains all relevant data to track the tcp connection
 type scan_data_item struct {
 	id        uint64
 	ts        int64
@@ -54,55 +85,43 @@ type scan_data_item struct {
 	following *scan_data_item
 }
 
+// key for the map below
 type scan_item_key struct {
 	port layers.TCPPort
 	seq  uint32
 }
+
+// map to track tcp connections, key is a tuple of (port, seq)
 type root_scan_data struct {
 	mu    sync.Mutex
 	items map[scan_item_key]scan_data_item
 }
 
+var scan_data root_scan_data
+
+// check whether a map entry with the provided sequence number and tcp port already exists
 func (cur_scan_data *root_scan_data) contains(seq uint32, port layers.TCPPort) bool {
-	pos_keys := []scan_item_key{{port, seq}}
-	for _, pos_key := range pos_keys {
-		_, ok := cur_scan_data.items[pos_key]
-		if ok {
-			return true
-		}
+	_, ok := cur_scan_data.items[scan_item_key{port, seq}]
+	if ok {
+		return true
 	}
 	return false
 }
 
-var scan_data root_scan_data
-
 func handle_pkt(pkt gopacket.Packet) {
 	log.Println(pkt)
+
 }
 
 func packet_capture(handle *pcapgo.EthernetHandle) {
 	defer wg.Done()
 	log.Println("starting packet capture")
-
-	/*for {
-		pkt_data, ci, err := handle.ReadPacketData()
-		if err == io.EOF {
-			log.Println("reached EOF")
-			break
-		}
-		if err != nil {
-			panic(err)
-		}
-		go handle_pkt(pkt_data, ci)
-	}
-	log.Println("stopped packet capture")*/
 	pkt_src := gopacket.NewPacketSource(
 		handle, layers.LinkTypeEthernet).Packets()
 	for {
 		select {
 		case pkt := <-pkt_src:
-			// kowalski, analysis
-			handle_pkt(pkt)
+			go handle_pkt(pkt)
 			break
 		case <-stop_chan:
 			log.Println("stopping packet capture")
@@ -115,7 +134,6 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 	ip_hash := sha256.New()
 	ip_hash.Write([]byte(dst_ip))
 	hash_sum := ip_hash.Sum(nil)
-	log.Println(dst_ip, "hash=", hex.EncodeToString(hash_sum))
 	// generate sequence number based on first two bytes of ip hash
 	seq := uint32(hash_sum[0])<<10 + uint32(hash_sum[1])<<18
 	log.Println(dst_ip, "seq_num=", seq)
@@ -150,7 +168,7 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 	ip := layers.IPv4{
 		Version:  4,
 		TTL:      64,
-		SrcIP:    net.ParseIP(iface_ip),
+		SrcIP:    net.ParseIP(cfg.Iface_ip),
 		DstIP:    dst_ip,
 		Protocol: layers.IPProtocolTCP,
 	}
@@ -211,7 +229,6 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 		panic(err)
 	}
 
-	fmt.Println("monke never cramps")
 	if err = raw_con.WriteTo(ip_head, tcp_buf.Bytes(), nil); err != nil {
 		panic(err)
 	}
@@ -231,10 +248,10 @@ func get_next_id() uint64 {
 	return ip_loop_id.id
 }
 
-func init_tcp() {
+func init_tcp(port_min uint16, port_max uint16) {
 	defer wg.Done()
-	//dst_ip := net.ParseIP("1.1.1.1")
-	port := layers.TCPPort(62003)
+	// choose a random port in the provided range
+	port := layers.TCPPort(rand.Intn(int(port_max)-int(port_min)) + int(port_min))
 	for {
 		select {
 		case dst_ip := <-ip_chan:
@@ -262,6 +279,8 @@ func read_ips_file() {
 	if err := scanner.Err(); err != nil {
 		log.Fatal(err)
 	}
+	log.Println("read all ips, waiting to end ...")
+	time.Sleep(10 * time.Second)
 	close(stop_chan)
 }
 
@@ -273,22 +292,31 @@ func close_handle(handle *pcapgo.EthernetHandle) {
 	log.Println("handle closed")
 }
 
+func load_config() {
+	err := cleanenv.ReadConfig("config.yml", &cfg)
+	if err != nil {
+		panic(err)
+	}
+	log.Println("config:", cfg)
+}
+
 func main() {
+	load_config()
 	ip_loop_id.id = 0
 	scan_data.items = make(map[scan_item_key]scan_data_item)
 	// start packet capture
-	handle, err := pcapgo.NewEthernetHandle(iface_name) //pcap.OpenLive("wlp1s0", defaultSnapLen, true,
+	handle, err := pcapgo.NewEthernetHandle(cfg.Iface_name) //pcap.OpenLive("wlp1s0", defaultSnapLen, true,
 	//pcap.BlockForever)
 	if err != nil {
 		panic(err)
 	}
 	defer handle.Close()
 
-	iface, err := net.InterfaceByName(iface_name)
+	iface, err := net.InterfaceByName(cfg.Iface_name)
 	if err != nil {
 		panic(err)
 	}
-	bpf_instr, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, iface.MTU, fmt.Sprint("tcp and ip dst ", iface_ip, " and src port 53"))
+	bpf_instr, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, iface.MTU, fmt.Sprint("tcp and ip dst ", cfg.Iface_ip, " and src port 53"))
 	var bpf_raw []bpf.RawInstruction
 	bpf_raw = bpfutils.ToBpfRawInstructions(bpf_instr)
 	if err := handle.SetBPF(bpf_raw); err != nil {
@@ -296,7 +324,7 @@ func main() {
 	}
 	// create raw l3 socket
 	var pkt_con net.PacketConn
-	pkt_con, err = net.ListenPacket("ip4:tcp", iface_ip)
+	pkt_con, err = net.ListenPacket("ip4:tcp", cfg.Iface_ip)
 	if err != nil {
 		panic(err)
 	}
@@ -311,7 +339,7 @@ func main() {
 	go packet_capture(handle)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
-		go init_tcp()
+		go init_tcp(cfg.Port_min, cfg.Port_max)
 	}
 	go close_handle(handle)
 	wg.Wait()
