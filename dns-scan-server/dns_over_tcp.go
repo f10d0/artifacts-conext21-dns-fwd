@@ -33,6 +33,8 @@ type cfg_db struct {
 	Dns_query  string `yaml:"dns_query"`
 }
 
+// TODO timeout non answering and remove keys from map
+
 var cfg cfg_db
 
 var wg sync.WaitGroup
@@ -124,28 +126,6 @@ func send_tcp_pkt(ip layers.IPv4, tcp layers.TCP, payload []byte) {
 	}
 }
 
-func send_tcp_pkt_dns(ip layers.IPv4, tcp layers.TCP, dns layers.DNS) {
-	ip_head_buf := gopacket.NewSerializeBuffer()
-	err := ip.SerializeTo(ip_head_buf, opts)
-	if err != nil {
-		panic(err)
-	}
-	ip_head, err := ipv4.ParseHeader(ip_head_buf.Bytes())
-	if err != nil {
-		panic(err)
-	}
-
-	tcp_buf := gopacket.NewSerializeBuffer()
-	err = gopacket.SerializeLayers(tcp_buf, opts, &tcp, &dns)
-	if err != nil {
-		panic(err)
-	}
-
-	if err = raw_con.WriteTo(ip_head, tcp_buf.Bytes(), nil); err != nil {
-		panic(err)
-	}
-}
-
 func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, ack_num uint32) {
 	// === build packet ===
 	// Create ip layer
@@ -155,6 +135,7 @@ func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, a
 		SrcIP:    net.ParseIP(cfg.Iface_ip),
 		DstIP:    dst_ip,
 		Protocol: layers.IPProtocolTCP,
+		Id:       1,
 	}
 
 	// Create tcp layer
@@ -165,103 +146,99 @@ func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, a
 		PSH:     true,
 		Seq:     ack_num,
 		Ack:     seq_num + 1,
-		Window:  512,
+		Window:  8192,
 	}
 	tcp.SetNetworkLayerForChecksum(&ip)
 
 	qst := layers.DNSQuestion{
-		Name:  []byte(cfg.Dns_query + "."),
-		Type:  layers.DNSTypeA,
-		Class: layers.DNSClassIN,
+		Name:  []byte(cfg.Dns_query),
+		Type:  layers.DNSType(1),  //layers.DNSTypeCNAME,
+		Class: layers.DNSClass(1), //layers.DNSClassIN,
 	}
 
 	// create dns layers
 	dns := layers.DNS{
-		/*BaseLayer:    layers.BaseLayer{},
-		ID:           0, //TODO RNG
-		QR:           false,
-		OpCode:       0,
-		AA:           false,
-		TC:           false,
-		RD:           true,
-		RA:           true,
-		Z:            0,
-		ResponseCode: 0,
-		QDCount:      1,
-		ANCount:      1,
-		NSCount:      0,
-		ARCount:      0,
-		Questions:    []layers.DNSQuestion{qst},*/
 		Questions: []layers.DNSQuestion{qst},
 		RD:        true,
 		QDCount:   1,
 		OpCode:    layers.DNSOpCodeQuery,
-		ANCount:   1,
-		QR:        false,
+		ID:        uint16(rand.Intn(65536)),
 	}
 
 	dns_buf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(dns_buf, opts, &dns)
-	//send_tcp_pkt(ip, tcp, dns_buf.Bytes())
-	send_tcp_pkt_dns(ip, tcp, dns)
+	gopacket.SerializeLayers(dns_buf, gopacket.SerializeOptions{}, &dns)
+	// prepend dns payload with its size, as gopacket does not do this automatically
+	dns_buf_bytes := dns_buf.Bytes()
+	dns_corrected := make([]byte, len(dns_buf_bytes)+2)
+	dns_corrected[0] = uint8(0)
+	dns_corrected[1] = uint8(len(dns_buf_bytes))
+	for i := 0; i < len(dns_buf_bytes); i++ {
+		dns_corrected[i+2] = dns_buf_bytes[i]
+	}
+	send_tcp_pkt(ip, tcp, dns_corrected)
 }
 
 func handle_pkt(pkt gopacket.Packet) {
-	log.Println(pkt)
+	//log.Println(pkt)
 
 	ip_layer := pkt.Layer(layers.LayerTypeIPv4)
+	if ip_layer == nil {
+		return
+	}
 	ip, ok := ip_layer.(*layers.IPv4)
 	if !ok {
+		// TODO remove key -> Timeout
 		return
 	}
 
 	tcp_layer := pkt.Layer(layers.LayerTypeTCP)
-	if tcp_layer != nil {
-		if pkt.ApplicationLayer() == nil {
-			tcp, ok := tcp_layer.(*layers.TCP)
-			if !ok { // skip wrong packets
+	if tcp_layer == nil {
+		return
+	}
+	tcp, ok := tcp_layer.(*layers.TCP)
+	if !ok { // skip wrong packets
+		return
+	}
+	if pkt.ApplicationLayer() == nil {
+		// SYN-ACK
+		if tcp.SYN && tcp.ACK {
+			log.Println("received SYN-ACK")
+			// check if item in map and assign value
+			root_data_item, ok := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 1}]
+			if !ok {
 				return
 			}
-			// SYN-ACK
-			if tcp.SYN && tcp.ACK {
-				log.Println("received SYN-ACK")
-				// check if item in map
-				if !scan_data.contains(tcp.DstPort, tcp.Ack-1) {
+			last_data_item := root_data_item.last()
+			data := scan_data_item{
+				id:   last_data_item.id,
+				ts:   time.Now().Unix(),
+				port: tcp.DstPort,
+				seq:  tcp.Seq,
+				ack:  tcp.Ack,
+				ip:   ip.SrcIP,
+				flags: TCP_flags{
+					FIN: tcp.FIN,
+					SYN: tcp.SYN,
+					RST: tcp.RST,
+					PSH: tcp.PSH,
+					ACK: tcp.ACK,
+				},
+			}
+			last_data_item.next = &data
+			send_ack_with_dns(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack)
+		} else
+		// PSH-ACK == DNS Response
+		if tcp.PSH && tcp.ACK {
+			log.Println("received PSH-ACK")
+			// decode as DNS Packet
+			dns_layer := pkt.Layer(layers.LayerTypeDNS)
+			if dns_layer != nil {
+				log.Println("got DNS response")
+				dns, ok := dns_layer.(*layers.DNS)
+				if !ok {
 					return
 				}
-				root_data_item, _ := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 1}]
-				last_data_item := root_data_item.last()
-				data := scan_data_item{
-					id:   last_data_item.id,
-					ts:   time.Now().Unix(),
-					port: tcp.DstPort,
-					seq:  tcp.Seq,
-					ack:  tcp.Ack,
-					ip:   ip.SrcIP,
-					flags: TCP_flags{
-						FIN: tcp.FIN,
-						SYN: tcp.SYN,
-						RST: tcp.RST,
-						PSH: tcp.PSH,
-						ACK: tcp.ACK,
-					},
-				}
-				last_data_item.next = &data
-				send_ack_with_dns(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack)
-			} else
-			// PSH-ACK == DNS Response
-			if tcp.PSH && tcp.ACK {
-				log.Println("received PSH-ACK")
-				// decode as DNS Packet
-				dns_layer := pkt.Layer(layers.LayerTypeDNS)
-				if dns_layer != nil {
-					log.Println("got DNS response")
-					dns, ok := dns_layer.(*layers.DNS)
-					if !ok {
-						return
-					}
-					log.Println(dns.Answers)
-				}
+				log.Println(dns.Answers)
 			}
 		}
 	}
@@ -276,7 +253,6 @@ func packet_capture(handle *pcapgo.EthernetHandle) {
 		select {
 		case pkt := <-pkt_src:
 			go handle_pkt(pkt)
-			break
 		case <-stop_chan:
 			log.Println("stopping packet capture")
 			return
@@ -325,6 +301,7 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 		SrcIP:    net.ParseIP(cfg.Iface_ip),
 		DstIP:    dst_ip,
 		Protocol: layers.IPProtocolTCP,
+		Id:       1,
 	}
 
 	// Create tcp layer
@@ -345,6 +322,7 @@ type u64id struct {
 	id uint64
 }
 
+// id for saving to results file, synced between multiple init_tcp()
 var ip_loop_id u64id
 
 func get_next_id() uint64 {
