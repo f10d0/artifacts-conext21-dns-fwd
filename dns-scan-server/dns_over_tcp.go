@@ -50,9 +50,10 @@ type TCP_flags struct {
 	FIN, SYN, RST, PSH, ACK bool
 }
 
+var DNS_PAYLOAD_SIZE uint16
+
 const (
-	DNS_PAYLOAD_SIZE uint16 = 54
-	ip_filepath      string = "test_ip1"
+	ip_filepath string = "test_ip1"
 )
 
 // this struct contains all relevant data to track the tcp connection
@@ -88,7 +89,9 @@ type root_scan_data struct {
 	items map[scan_item_key]scan_data_item
 }
 
-var scan_data root_scan_data
+var scan_data root_scan_data = root_scan_data{
+	items: make(map[scan_item_key]scan_data_item),
+}
 
 // check whether a map entry with the provided sequence number and tcp port already exists
 func (cur_scan_data *root_scan_data) contains(port layers.TCPPort, seq uint32) bool {
@@ -126,7 +129,7 @@ func send_tcp_pkt(ip layers.IPv4, tcp layers.TCP, payload []byte) {
 	}
 }
 
-func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, ack_num uint32) {
+func build_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, ack_num uint32) (layers.IPv4, layers.TCP, []byte) {
 	// === build packet ===
 	// Create ip layer
 	ip := layers.IPv4{
@@ -150,13 +153,12 @@ func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, a
 	}
 	tcp.SetNetworkLayerForChecksum(&ip)
 
+	// create dns layers
 	qst := layers.DNSQuestion{
 		Name:  []byte(cfg.Dns_query),
-		Type:  layers.DNSType(1),  //layers.DNSTypeCNAME,
-		Class: layers.DNSClass(1), //layers.DNSClassIN,
+		Type:  layers.DNSTypeA,
+		Class: layers.DNSClassIN,
 	}
-
-	// create dns layers
 	dns := layers.DNS{
 		Questions: []layers.DNSQuestion{qst},
 		RD:        true,
@@ -175,7 +177,11 @@ func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, a
 	for i := 0; i < len(dns_buf_bytes); i++ {
 		dns_corrected[i+2] = dns_buf_bytes[i]
 	}
-	send_tcp_pkt(ip, tcp, dns_corrected)
+	return ip, tcp, dns_corrected
+}
+
+func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, ack_num uint32) {
+	send_tcp_pkt(build_ack_with_dns(dst_ip, src_port, seq_num, ack_num))
 }
 
 func handle_pkt(pkt gopacket.Packet) {
@@ -209,6 +215,10 @@ func handle_pkt(pkt gopacket.Packet) {
 				return
 			}
 			last_data_item := root_data_item.last()
+			// this should not occur, this would be the case if a syn-ack is being received more than once
+			if last_data_item.flags.SYN && last_data_item.flags.ACK {
+				return
+			}
 			data := scan_data_item{
 				id:   last_data_item.id,
 				ts:   time.Now().Unix(),
@@ -227,20 +237,26 @@ func handle_pkt(pkt gopacket.Packet) {
 			last_data_item.next = &data
 			send_ack_with_dns(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack)
 		} else
-		// PSH-ACK == DNS Response
-		if tcp.PSH && tcp.ACK {
-			log.Println("received PSH-ACK")
-			// decode as DNS Packet
-			dns_layer := pkt.Layer(layers.LayerTypeDNS)
-			if dns_layer != nil {
-				log.Println("got DNS response")
-				dns, ok := dns_layer.(*layers.DNS)
-				if !ok {
-					return
-				}
-				log.Println(dns.Answers)
-			}
+		// FIN-ACK
+		if tcp.FIN && tcp.ACK {
+			log.Println("received FIN-ACK")
 		}
+	} else
+	// PSH-ACK == DNS Response
+	if tcp.PSH && tcp.ACK {
+		log.Println("received PSH-ACK")
+		// decode as DNS Packet
+		dns_layer := pkt.Layer(layers.LayerTypeDNS)
+		if dns_layer == nil {
+			log.Println("not dns")
+			return
+		}
+		log.Println("got DNS response")
+		dns, ok := dns_layer.(*layers.DNS)
+		if !ok {
+			return
+		}
+		log.Println(dns.Answers)
 	}
 }
 
@@ -323,7 +339,9 @@ type u64id struct {
 }
 
 // id for saving to results file, synced between multiple init_tcp()
-var ip_loop_id u64id
+var ip_loop_id u64id = u64id{
+	id: 0,
+}
 
 func get_next_id() uint64 {
 	ip_loop_id.mu.Lock()
@@ -386,8 +404,9 @@ func load_config() {
 
 func main() {
 	load_config()
-	ip_loop_id.id = 0
-	scan_data.items = make(map[scan_item_key]scan_data_item)
+	// set the DNS_PAYLOAD_SIZE once as it is static
+	_, _, dns_payload := build_ack_with_dns(net.ParseIP("0.0.0.0"), 0, 0, 0)
+	DNS_PAYLOAD_SIZE = uint16(len(dns_payload))
 	// start packet capture
 	handle, err := pcapgo.NewEthernetHandle(cfg.Iface_name) //pcap.OpenLive("wlp1s0", defaultSnapLen, true,
 	//pcap.BlockForever)
