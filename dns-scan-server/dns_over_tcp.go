@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
 	"time"
 
@@ -56,6 +57,8 @@ const (
 	ip_filepath string = "test_ip1"
 )
 
+var waiting_to_end = false
+
 // this struct contains all relevant data to track the tcp connection
 type scan_data_item struct {
 	id       uint64
@@ -66,15 +69,15 @@ type scan_data_item struct {
 	ack      uint32
 	flags    TCP_flags
 	dns_recs []net.IP
-	next     *scan_data_item
+	Next     *scan_data_item
 }
 
 func (item *scan_data_item) last() *scan_data_item {
-	if item.next == nil {
-		return item
-	} else {
-		return item.last()
+	var cur *scan_data_item = item
+	for cur.Next != nil {
+		cur = cur.Next
 	}
+	return cur
 }
 
 // key for the map below
@@ -86,11 +89,11 @@ type scan_item_key struct {
 // map to track tcp connections, key is a tuple of (port, seq)
 type root_scan_data struct {
 	mu    sync.Mutex
-	items map[scan_item_key]scan_data_item
+	items map[scan_item_key]*scan_data_item
 }
 
 var scan_data root_scan_data = root_scan_data{
-	items: make(map[scan_item_key]scan_data_item),
+	items: make(map[scan_item_key]*scan_data_item),
 }
 
 // check whether a map entry with the provided sequence number and tcp port already exists
@@ -184,6 +187,32 @@ func send_ack_with_dns(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, a
 	send_tcp_pkt(build_ack_with_dns(dst_ip, src_port, seq_num, ack_num))
 }
 
+func send_ack_pos_fin(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, ack_num uint32, fin bool) {
+	// === build packet ===
+	// Create ip layer
+	ip := layers.IPv4{
+		Version:  4,
+		TTL:      64,
+		SrcIP:    net.ParseIP(cfg.Iface_ip),
+		DstIP:    dst_ip,
+		Protocol: layers.IPProtocolTCP,
+		Id:       1,
+	}
+
+	// Create tcp layer
+	tcp := layers.TCP{
+		SrcPort: src_port,
+		DstPort: layers.TCPPort(cfg.Dst_port),
+		ACK:     true,
+		FIN:     fin,
+		Seq:     ack_num,
+		Ack:     seq_num + 1,
+		Window:  8192,
+	}
+	tcp.SetNetworkLayerForChecksum(&ip)
+	send_tcp_pkt(ip, tcp, nil)
+}
+
 func handle_pkt(pkt gopacket.Packet) {
 	//log.Println(pkt)
 
@@ -234,29 +263,76 @@ func handle_pkt(pkt gopacket.Packet) {
 					ACK: tcp.ACK,
 				},
 			}
-			last_data_item.next = &data
+			(*last_data_item).Next = &data
 			send_ack_with_dns(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack)
 		} else
 		// FIN-ACK
 		if tcp.FIN && tcp.ACK {
 			log.Println("received FIN-ACK")
+			_, ok := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 2 - uint32(DNS_PAYLOAD_SIZE)}]
+			if !ok {
+				return
+			}
+			log.Println("ACKing FIN-ACK")
+			send_ack_pos_fin(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack, false)
 		}
 	} else
 	// PSH-ACK == DNS Response
 	if tcp.PSH && tcp.ACK {
 		log.Println("received PSH-ACK")
 		// decode as DNS Packet
-		dns_layer := pkt.Layer(layers.LayerTypeDNS)
-		if dns_layer == nil {
-			log.Println("not dns")
+		dns := &layers.DNS{}
+		// remove the first two bytes of the payload, i.e. size of the dns response
+		// see build_ack_with_dns()
+		pld := make([]byte, len(tcp.Payload)-2)
+		for i := 0; i < len(pld); i++ {
+			pld[i] = tcp.Payload[i+2]
+		}
+		err := dns.DecodeFromBytes(pld, gopacket.NilDecodeFeedback)
+		if err != nil {
+			log.Println("DNS not found")
 			return
 		}
 		log.Println("got DNS response")
-		dns, ok := dns_layer.(*layers.DNS)
+		// check if item in map and assign value
+		root_data_item, ok := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 1 - uint32(DNS_PAYLOAD_SIZE)}]
 		if !ok {
 			return
 		}
-		log.Println(dns.Answers)
+		last_data_item := root_data_item.last()
+		// this should not occur, this would be the case if a psh-ack is being received more than once
+		if last_data_item.flags.PSH && last_data_item.flags.ACK {
+			log.Println("already received PSH-ACK")
+			return
+		}
+		answers := dns.Answers
+		for _, answer := range answers {
+			if answer.IP != nil {
+				log.Println(answer.IP)
+			} else {
+				log.Println("non IP type found in answer")
+				return
+			}
+		}
+		data := scan_data_item{
+			id:   last_data_item.id,
+			ts:   time.Now().Unix(),
+			port: tcp.DstPort,
+			seq:  tcp.Seq,
+			ack:  tcp.Ack,
+			ip:   ip.SrcIP,
+			flags: TCP_flags{
+				FIN: tcp.FIN,
+				SYN: tcp.SYN,
+				RST: tcp.RST,
+				PSH: tcp.PSH,
+				ACK: tcp.ACK,
+			},
+		}
+		last_data_item.Next = &data
+		// TODO write to file, and remove from map
+		// send FIN-ACK to server
+		send_ack_pos_fin(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack, true)
 	}
 }
 
@@ -281,7 +357,7 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 	ip_hash.Write([]byte(dst_ip))
 	hash_sum := ip_hash.Sum(nil)
 	// generate sequence number based on first two bytes of ip hash
-	seq := uint32(hash_sum[0])<<10 + uint32(hash_sum[1])<<18
+	seq := uint32(hash_sum[0]) + uint32(hash_sum[1])<<8
 	log.Println(dst_ip, "seq_num=", seq)
 	// check for sequence number collisions
 	scan_data.mu.Lock()
@@ -303,10 +379,10 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 			SYN: true,
 		},
 		dns_recs: nil,
-		next:     nil,
+		Next:     nil,
 	}
 	log.Println("scan_data=", s_d_item)
-	scan_data.items[scan_item_key{port, seq}] = s_d_item
+	scan_data.items[scan_item_key{port, seq}] = &s_d_item
 	scan_data.mu.Unlock()
 
 	// === build packet ===
@@ -382,6 +458,9 @@ func read_ips_file() {
 		log.Fatal(err)
 	}
 	log.Println("read all ips, waiting to end ...")
+	// timeout to send out SYNs & handle the responses
+	// of the IPs just read
+	waiting_to_end = true
 	time.Sleep(10 * time.Second)
 	close(stop_chan)
 }
@@ -403,6 +482,21 @@ func load_config() {
 }
 
 func main() {
+	// TODO write start ts to log
+	// handle ctrl+c SIGINT
+	go func() {
+		interrupt_chan := make(chan os.Signal, 1)
+		signal.Notify(interrupt_chan, os.Interrupt)
+		<-interrupt_chan
+		if waiting_to_end {
+			log.Println("already ending")
+		} else {
+			log.Println("received SIGINT, ending")
+			close(stop_chan)
+		}
+		//TODO write end ts to log
+	}()
+
 	load_config()
 	// set the DNS_PAYLOAD_SIZE once as it is static
 	_, _, dns_payload := build_ack_with_dns(net.ParseIP("0.0.0.0"), 0, 0, 0)
