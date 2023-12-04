@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/csv"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"time"
 
@@ -103,6 +105,74 @@ func (cur_scan_data *root_scan_data) contains(port layers.TCPPort, seq uint32) b
 		return true
 	}
 	return false
+}
+
+var write_chan = make(chan *scan_data_item, 4096)
+
+func scan_item_to_strarr(scan_item *scan_data_item) []string {
+	// transform scan_item into string array for csv writer
+	var record []string
+	record = append(record, strconv.Itoa(int(scan_item.id)))
+	record = append(record, time.Unix(scan_item.ts, 0).String())
+	record = append(record, scan_item.ip.String())
+	record = append(record, scan_item.port.String())
+	record = append(record, strconv.Itoa(int(scan_item.seq)))
+	record = append(record, strconv.Itoa(int(scan_item.ack)))
+	var flags string
+	if scan_item.flags.SYN {
+		flags += "S"
+	}
+	if scan_item.flags.RST {
+		flags += "R"
+	}
+	if scan_item.flags.FIN {
+		flags += "F"
+	}
+	if scan_item.flags.PSH {
+		flags += "P"
+	}
+	if scan_item.flags.ACK {
+		flags += "A"
+	}
+	record = append(record, flags)
+	dns_answers := ""
+	for i, dns_ip := range scan_item.dns_recs {
+		dns_answers += dns_ip.String()
+		if i != len(scan_item.dns_recs)-1 {
+			dns_answers += ","
+		}
+	}
+	record = append(record, dns_answers)
+	return record
+}
+
+func write_results() {
+	defer wg.Done()
+	csvfile, err := os.Create("tcp_results.csv")
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	defer csvfile.Close()
+
+	writer := csv.NewWriter(csvfile)
+	writer.Comma = ';'
+	defer writer.Flush()
+
+	for {
+		select {
+		case root_item := <-write_chan:
+			scan_item := root_item
+			for scan_item != nil {
+				writer.Write(scan_item_to_strarr(scan_item))
+				scan_item = scan_item.Next
+			}
+			// remove entry from map
+			delete(scan_data.items, scan_item_key{root_item.port, root_item.seq})
+		case <-stop_chan:
+			return
+		}
+	}
 }
 
 var opts gopacket.SerializeOptions = gopacket.SerializeOptions{
@@ -269,12 +339,13 @@ func handle_pkt(pkt gopacket.Packet) {
 		// FIN-ACK
 		if tcp.FIN && tcp.ACK {
 			log.Println("received FIN-ACK")
-			_, ok := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 2 - uint32(DNS_PAYLOAD_SIZE)}]
+			root_data_item, ok := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 2 - uint32(DNS_PAYLOAD_SIZE)}]
 			if !ok {
 				return
 			}
 			log.Println("ACKing FIN-ACK")
 			send_ack_pos_fin(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack, false)
+			write_chan <- root_data_item
 		}
 	} else
 	// PSH-ACK == DNS Response
@@ -306,8 +377,10 @@ func handle_pkt(pkt gopacket.Packet) {
 			return
 		}
 		answers := dns.Answers
+		var answers_ip []net.IP
 		for _, answer := range answers {
 			if answer.IP != nil {
+				answers_ip = append(answers_ip, answer.IP)
 				log.Println(answer.IP)
 			} else {
 				log.Println("non IP type found in answer")
@@ -328,9 +401,9 @@ func handle_pkt(pkt gopacket.Packet) {
 				PSH: tcp.PSH,
 				ACK: tcp.ACK,
 			},
+			dns_recs: answers_ip,
 		}
 		last_data_item.Next = &data
-		// TODO write to file, and remove from map
 		// send FIN-ACK to server
 		send_ack_pos_fin(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack, true)
 	}
@@ -531,7 +604,8 @@ func main() {
 	}
 
 	// start packet capture as goroutine
-	wg.Add(3)
+	wg.Add(4)
+	go write_results()
 	go read_ips_file()
 	go packet_capture(handle)
 	for i := 0; i < 8; i++ {
