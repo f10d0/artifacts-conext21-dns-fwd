@@ -150,8 +150,7 @@ func write_results() {
 	defer wg.Done()
 	csvfile, err := os.Create("tcp_results.csv")
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		panic(err)
 	}
 	defer csvfile.Close()
 
@@ -554,8 +553,17 @@ func load_config() {
 	log.Println("config:", cfg)
 }
 
+func write_to_log(msg string) {
+	logfile, err := os.OpenFile("run.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		panic(err)
+	}
+	logfile.WriteString(msg + "\n")
+}
+
 func main() {
-	// TODO write start ts to log
+	// write start ts to log
+	write_to_log("START " + time.Now().UTC().String())
 	// handle ctrl+c SIGINT
 	go func() {
 		interrupt_chan := make(chan os.Signal, 1)
@@ -567,7 +575,6 @@ func main() {
 			log.Println("received SIGINT, ending")
 			close(stop_chan)
 		}
-		//TODO write end ts to log
 	}()
 
 	load_config()
@@ -615,5 +622,6 @@ func main() {
 	go close_handle(handle)
 	wg.Wait()
 	log.Println("all routines finished")
+	write_to_log("END " + time.Now().UTC().String())
 	log.Println("program done")
 }
