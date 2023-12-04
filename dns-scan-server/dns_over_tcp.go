@@ -36,8 +36,6 @@ type cfg_db struct {
 	Dns_query  string `yaml:"dns_query"`
 }
 
-// TODO timeout non answering and remove keys from map
-
 var cfg cfg_db
 
 var wg sync.WaitGroup
@@ -167,7 +165,30 @@ func write_results() {
 				scan_item = scan_item.Next
 			}
 			// remove entry from map
+			scan_data.mu.Lock()
 			delete(scan_data.items, scan_item_key{root_item.port, root_item.seq})
+			scan_data.mu.Unlock()
+		case <-stop_chan:
+			return
+		}
+	}
+}
+
+// periodically remove keys (=connections) that get no response from map
+func timeout() {
+	defer wg.Done()
+	for {
+		select {
+		case <-time.After(10 * time.Second):
+			//go through map's keyset
+			scan_data.mu.Lock()
+			for k, v := range scan_data.items {
+				//remove each key where its timestamp is older than x seconds
+				if time.Now().Unix()-v.ts > 10 {
+					delete(scan_data.items, k)
+				}
+			}
+			scan_data.mu.Unlock()
 		case <-stop_chan:
 			return
 		}
@@ -291,7 +312,6 @@ func handle_pkt(pkt gopacket.Packet) {
 	}
 	ip, ok := ip_layer.(*layers.IPv4)
 	if !ok {
-		// TODO remove key -> Timeout
 		return
 	}
 
@@ -308,7 +328,9 @@ func handle_pkt(pkt gopacket.Packet) {
 		if tcp.SYN && tcp.ACK {
 			log.Println("received SYN-ACK")
 			// check if item in map and assign value
+			scan_data.mu.Lock()
 			root_data_item, ok := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 1}]
+			scan_data.mu.Unlock()
 			if !ok {
 				return
 			}
@@ -338,7 +360,9 @@ func handle_pkt(pkt gopacket.Packet) {
 		// FIN-ACK
 		if tcp.FIN && tcp.ACK {
 			log.Println("received FIN-ACK")
+			scan_data.mu.Lock()
 			root_data_item, ok := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 2 - uint32(DNS_PAYLOAD_SIZE)}]
+			scan_data.mu.Unlock()
 			if !ok {
 				return
 			}
@@ -365,7 +389,9 @@ func handle_pkt(pkt gopacket.Packet) {
 		}
 		log.Println("got DNS response")
 		// check if item in map and assign value
+		scan_data.mu.Lock()
 		root_data_item, ok := scan_data.items[scan_item_key{tcp.DstPort, tcp.Ack - 1 - uint32(DNS_PAYLOAD_SIZE)}]
+		scan_data.mu.Unlock()
 		if !ok {
 			return
 		}
@@ -530,7 +556,7 @@ func read_ips_file() {
 		log.Fatal(err)
 	}
 	log.Println("read all ips, waiting to end ...")
-	// timeout to send out SYNs & handle the responses
+	// wait some time to send out SYNs & handle the responses
 	// of the IPs just read
 	waiting_to_end = true
 	time.Sleep(10 * time.Second)
@@ -611,8 +637,9 @@ func main() {
 	}
 
 	// start packet capture as goroutine
-	wg.Add(4)
+	wg.Add(5)
 	go write_results()
+	go timeout()
 	go read_ips_file()
 	go packet_capture(handle)
 	for i := 0; i < 8; i++ {
