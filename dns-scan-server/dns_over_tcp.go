@@ -54,7 +54,7 @@ type TCP_flags struct {
 var DNS_PAYLOAD_SIZE uint16
 
 const (
-	ip_filepath string = "test_ip1"
+	ip_filepath string = "test-ips-odns"
 )
 
 var waiting_to_end = false
@@ -62,7 +62,7 @@ var waiting_to_end = false
 // this struct contains all relevant data to track the tcp connection
 type scan_data_item struct {
 	id       uint64
-	ts       int64
+	ts       time.Time
 	ip       net.IP
 	port     layers.TCPPort
 	seq      uint32
@@ -111,7 +111,7 @@ func scan_item_to_strarr(scan_item *scan_data_item) []string {
 	// transform scan_item into string array for csv writer
 	var record []string
 	record = append(record, strconv.Itoa(int(scan_item.id)))
-	record = append(record, time.Unix(scan_item.ts, 0).String())
+	record = append(record, scan_item.ts.Format("2006-01-02 15:04:05.000000"))
 	record = append(record, scan_item.ip.String())
 	record = append(record, scan_item.port.String())
 	record = append(record, strconv.Itoa(int(scan_item.seq)))
@@ -184,7 +184,7 @@ func timeout() {
 			scan_data.mu.Lock()
 			for k, v := range scan_data.items {
 				//remove each key where its timestamp is older than x seconds
-				if time.Now().Unix()-v.ts > 10 {
+				if time.Now().Unix()-v.ts.Unix() > 10 {
 					delete(scan_data.items, k)
 				}
 			}
@@ -341,7 +341,7 @@ func handle_pkt(pkt gopacket.Packet) {
 			}
 			data := scan_data_item{
 				id:   last_data_item.id,
-				ts:   time.Now().Unix(),
+				ts:   time.Now(),
 				port: tcp.DstPort,
 				seq:  tcp.Seq,
 				ack:  tcp.Ack,
@@ -378,9 +378,13 @@ func handle_pkt(pkt gopacket.Packet) {
 		dns := &layers.DNS{}
 		// remove the first two bytes of the payload, i.e. size of the dns response
 		// see build_ack_with_dns()
-		pld := make([]byte, len(tcp.Payload)-2)
+		// FIXME
+		if len(tcp.LayerPayload()) <= 2 {
+			return
+		}
+		pld := make([]byte, len(tcp.LayerPayload())-2)
 		for i := 0; i < len(pld); i++ {
-			pld[i] = tcp.Payload[i+2]
+			pld[i] = tcp.LayerPayload()[i+2]
 		}
 		err := dns.DecodeFromBytes(pld, gopacket.NilDecodeFeedback)
 		if err != nil {
@@ -414,7 +418,7 @@ func handle_pkt(pkt gopacket.Packet) {
 		}
 		data := scan_data_item{
 			id:   last_data_item.id,
-			ts:   time.Now().Unix(),
+			ts:   time.Now(),
 			port: tcp.DstPort,
 			seq:  tcp.Seq,
 			ack:  tcp.Ack,
@@ -464,7 +468,7 @@ func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
 	}
 	s_d_item := scan_data_item{
 		id:   id,
-		ts:   time.Now().Unix(),
+		ts:   time.Now(),
 		ip:   dst_ip,
 		port: port,
 		seq:  seq,
@@ -584,6 +588,7 @@ func write_to_log(msg string) {
 	if err != nil {
 		panic(err)
 	}
+	defer logfile.Close()
 	logfile.WriteString(msg + "\n")
 }
 
