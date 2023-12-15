@@ -382,6 +382,11 @@ func handle_pkt(pkt gopacket.Packet) {
 		if len(tcp.LayerPayload()) <= 2 {
 			return
 		}
+		// validate payload size
+		pld_size := int(tcp.LayerPayload()[0]) + int(tcp.LayerPayload()[1])<<8
+		if pld_size == len(tcp.LayerPayload())-2 {
+			return
+		}
 		pld := make([]byte, len(tcp.LayerPayload())-2)
 		for i := 0; i < len(pld); i++ {
 			pld[i] = tcp.LayerPayload()[i+2]
