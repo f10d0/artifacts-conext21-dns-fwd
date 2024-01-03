@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/csv"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -20,7 +22,6 @@ import (
 	"github.com/google/gopacket/pcapgo"
 	"github.com/ilyakaznacheev/cleanenv"
 
-	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
 
 	"github.com/breml/bpfutils"
@@ -99,10 +100,7 @@ var scan_data root_scan_data = root_scan_data{
 // check whether a map entry with the provided sequence number and tcp port already exists
 func (cur_scan_data *root_scan_data) contains(port layers.TCPPort, seq uint32) bool {
 	_, ok := cur_scan_data.items[scan_item_key{port, seq}]
-	if ok {
-		return true
-	}
-	return false
+	return ok
 }
 
 var write_chan = make(chan *scan_data_item, 4096)
@@ -541,7 +539,9 @@ func init_tcp(port_min uint16, port_max uint16) {
 		select {
 		case dst_ip := <-ip_chan:
 			id := get_next_id()
-			send_syn(id, dst_ip, port)
+			//send_syn(id, dst_ip, port)
+			log.Println("ip:", dst_ip, id, port)
+			time.Sleep(1)
 		case <-stop_chan:
 			return
 		}
@@ -597,6 +597,64 @@ func write_to_log(msg string) {
 	logfile.WriteString(msg + "\n")
 }
 
+// Linear Congruential Generator
+// as described in https://stackoverflow.com/a/53551417
+type lcg_state struct {
+	value      int
+	offset     int
+	multiplier int
+	modulus    int
+	max        int
+	found      int
+}
+
+var lcg_ipv4 lcg_state
+
+func (lcg *lcg_state) init(stop int) {
+	// Seed range with a random integer.
+	lcg.value = rand.Intn(stop)
+	lcg.offset = rand.Intn(stop)*2 + 1                                  // Pick a random odd-valued offset.
+	lcg.multiplier = 4*(int(stop/4)) + 1                                // Pick a multiplier 1 greater than a multiple of 4
+	lcg.modulus = int(math.Pow(2, math.Ceil(math.Log2(float64(stop))))) // Pick a modulus just big enough to generate all numbers (power of 2)
+	lcg.found = 0                                                       // Track how many random numbers have been returned
+	lcg.max = stop
+}
+
+func (lcg *lcg_state) next() int {
+	for lcg.value >= lcg.max {
+		lcg.value = (lcg.value*lcg.multiplier + lcg.offset) % lcg.modulus
+	}
+	lcg.found += 1
+	value := lcg.value
+	// Calculate the next value in the sequence.
+	lcg.value = (lcg.value*lcg.multiplier + lcg.offset) % lcg.modulus
+	return value
+}
+
+func (lcg *lcg_state) has_next() bool {
+	return lcg.found < lcg.max
+}
+
+func ip42uint32(ip net.IP) uint32 {
+	return binary.BigEndian.Uint32(ip)
+}
+
+func uint322ip(ipint uint32) net.IP {
+	ip := make(net.IP, 4)
+	binary.BigEndian.PutUint32(ip, ipint)
+	return ip
+}
+
+func gen_ips(netip net.IP, hostsize int) {
+	defer wg.Done()
+	netip_int := ip42uint32(netip)
+	lcg_ipv4.init(int(math.Pow(2, float64(hostsize))))
+	for lcg_ipv4.has_next() {
+		val := lcg_ipv4.next()
+		ip_chan <- uint322ip(netip_int + uint32(val))
+	}
+}
+
 func main() {
 	// write start ts to log
 	write_to_log("START " + time.Now().UTC().String())
@@ -630,8 +688,10 @@ func main() {
 		panic(err)
 	}
 	bpf_instr, err := pcap.CompileBPFFilter(layers.LinkTypeEthernet, iface.MTU, fmt.Sprint("tcp and ip dst ", cfg.Iface_ip, " and src port 53"))
-	var bpf_raw []bpf.RawInstruction
-	bpf_raw = bpfutils.ToBpfRawInstructions(bpf_instr)
+	if err != nil {
+		panic(err)
+	}
+	bpf_raw := bpfutils.ToBpfRawInstructions(bpf_instr)
 	if err := handle.SetBPF(bpf_raw); err != nil {
 		panic(err)
 	}
@@ -650,7 +710,8 @@ func main() {
 	wg.Add(5)
 	go write_results()
 	go timeout()
-	go read_ips_file()
+	//go read_ips_file()
+	go gen_ips(net.ParseIP("0.0.0.0"), 32)
 	go packet_capture(handle)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
