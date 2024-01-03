@@ -26,6 +26,8 @@ import (
 	"golang.org/x/net/ipv4"
 
 	"github.com/breml/bpfutils"
+
+	"github.com/lrstanley/go-bogon"
 )
 
 // config
@@ -349,7 +351,7 @@ func handle_pkt(pkt gopacket.Packet) {
 					ACK: tcp.ACK,
 				},
 			}
-			(*last_data_item).Next = &data
+			last_data_item.Next = &data
 			send_ack_with_dns(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack)
 		} else
 		// FIN-ACK
@@ -535,10 +537,14 @@ func init_tcp(port_min uint16, port_max uint16) {
 	for {
 		select {
 		case dst_ip := <-ip_chan:
-			// TODO skip bogon ips
-			id := get_next_id()
-			log.Println("ip:", dst_ip, id, port)
-			send_syn(id, dst_ip, port)
+			// skip bogon ips
+			if is_bogon, _ := bogon.Is(dst_ip.String()); !is_bogon {
+				id := get_next_id()
+				log.Println("ip:", dst_ip, id, port)
+				send_syn(id, dst_ip, port)
+			} else {
+				log.Println("skipping bogon ip:", dst_ip)
+			}
 		case <-stop_chan:
 			return
 		}
