@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,10 +54,6 @@ type TCP_flags struct {
 }
 
 var DNS_PAYLOAD_SIZE uint16
-
-const (
-	ip_filepath string = "test-ips-odns"
-)
 
 var waiting_to_end = false
 
@@ -538,19 +535,19 @@ func init_tcp(port_min uint16, port_max uint16) {
 	for {
 		select {
 		case dst_ip := <-ip_chan:
+			// TODO skip bogon ips
 			id := get_next_id()
-			//send_syn(id, dst_ip, port)
 			log.Println("ip:", dst_ip, id, port)
-			time.Sleep(1)
+			send_syn(id, dst_ip, port)
 		case <-stop_chan:
 			return
 		}
 	}
 }
 
-func read_ips_file() {
+func read_ips_file(fname string) {
 	defer wg.Done()
-	file, err := os.Open(ip_filepath)
+	file, err := os.Open(fname)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -564,9 +561,9 @@ func read_ips_file() {
 	if err := scanner.Err(); err != nil {
 		log.Fatal(err)
 	}
-	log.Println("read all ips, waiting to end ...")
 	// wait some time to send out SYNs & handle the responses
 	// of the IPs just read
+	log.Println("read all ips, waiting to end ...")
 	waiting_to_end = true
 	time.Sleep(10 * time.Second)
 	close(stop_chan)
@@ -636,7 +633,7 @@ func (lcg *lcg_state) has_next() bool {
 }
 
 func ip42uint32(ip net.IP) uint32 {
-	return binary.BigEndian.Uint32(ip)
+	return binary.BigEndian.Uint32(ip.To4())
 }
 
 func uint322ip(ipint uint32) net.IP {
@@ -653,11 +650,45 @@ func gen_ips(netip net.IP, hostsize int) {
 		val := lcg_ipv4.next()
 		ip_chan <- uint322ip(netip_int + uint32(val))
 	}
+	// wait some time to send out SYNs & handle the responses
+	// of the IPs just read
+	log.Println("all ips generated, waiting to end ...")
+	waiting_to_end = true
+	time.Sleep(10 * time.Second)
+	close(stop_chan)
 }
 
 func main() {
 	// write start ts to log
 	write_to_log("START " + time.Now().UTC().String())
+
+	// command line args
+	if len(os.Args) < 1 {
+		write_to_log("END " + time.Now().UTC().String() + " arg not given")
+		log.Println("ERR need filename or net in CIDR notation")
+		return
+	}
+	ip_or_file_split := strings.Split(os.Args[1], "/")
+	var fname string
+	var netip net.IP
+	var hostsize int
+	if len(ip_or_file_split) == 1 {
+		// using filename
+		fname = ip_or_file_split[0]
+	} else if len(ip_or_file_split) == 2 {
+		// using CIDR net
+		netip = net.ParseIP(ip_or_file_split[0])
+		var err error
+		hostsize, err = strconv.Atoi(ip_or_file_split[1])
+		if err != nil {
+			panic(err)
+		}
+		hostsize = 32 - hostsize
+	} else {
+		write_to_log("END " + time.Now().UTC().String() + " wrongly formatted input arg")
+		log.Println("ERR check your input arg (filename or CIDR notation)")
+	}
+
 	// handle ctrl+c SIGINT
 	go func() {
 		interrupt_chan := make(chan os.Signal, 1)
@@ -708,11 +739,16 @@ func main() {
 
 	// start packet capture as goroutine
 	wg.Add(5)
+	go packet_capture(handle)
 	go write_results()
 	go timeout()
-	//go read_ips_file()
-	go gen_ips(net.ParseIP("0.0.0.0"), 32)
-	go packet_capture(handle)
+	if fname != "" {
+		log.Println("running in filename mode")
+		go read_ips_file(fname)
+	} else {
+		log.Println("running in CIDR mode")
+		go gen_ips(netip, hostsize)
+	}
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go init_tcp(cfg.Port_min, cfg.Port_max)
