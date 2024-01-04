@@ -372,9 +372,9 @@ func handle_pkt(pkt gopacket.Packet) {
 			// is reversely wronly identified as a different connection
 			// that is why we check here that the correct structure of SYN-SYNACK-PSHACK-PSHACK-FINACK-FINACK-ACK remains intact
 			// In theory this does not completely prevent the described from happening only reducing its probability
-			// which might be good enough, to do this more properly we would have to either ensure that every initial SEQ-num is
-			// followed by a blank space of number that can not be taken by other connections on that port
-			// basically we would need to divide the seq-num space into smaller blocks which are each like 64 bits apart
+			// which might be good enough, to do this more properly we would have to ensure that every initial SEQ-num is
+			// followed by a blank space of numbers that can not be taken by other connections on that port
+			// basically we would need to divide the seq-num space into smaller blocks which are each like 64 byte apart
 			if !(last_data_item.flags.PSH && last_data_item.flags.ACK) {
 				log.Println("missing PSH-ACK, dropping")
 				// to do this properly in theory, we would also need to send a FIN-ACK back to the server here,
