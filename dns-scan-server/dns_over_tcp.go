@@ -333,7 +333,7 @@ func handle_pkt(pkt gopacket.Packet) {
 			}
 			last_data_item := root_data_item.last()
 			// this should not occur, this would be the case if a syn-ack is being received more than once
-			if last_data_item.flags.SYN && last_data_item.flags.ACK {
+			if last_data_item != root_data_item {
 				return
 			}
 			data := scan_data_item{
@@ -352,7 +352,7 @@ func handle_pkt(pkt gopacket.Packet) {
 				},
 			}
 			last_data_item.Next = &data
-			send_ack_with_dns(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack)
+			send_ack_with_dns(root_data_item.ip, tcp.DstPort, tcp.Seq, tcp.Ack)
 		} else
 		// FIN-ACK
 		if tcp.FIN && tcp.ACK {
@@ -363,19 +363,47 @@ func handle_pkt(pkt gopacket.Packet) {
 			if !ok {
 				return
 			}
+
+			last_data_item := root_data_item.last()
+			// There is the case where after we send a PSH-ACK with the DNS-query the target server
+			// replies with a FIN-ACK without providing an answer to the query
+			// this FIN-ACK could trigger the ACKing and writeout of a completely different connections,
+			// because now the ACK-num which is 1+DNS_PAYLOAD_SIZE higher than the origianl SEQ-num
+			// is reversely wronly identified as a different connection
+			// that is why we check here that the correct structure of SYN-SYNACK-PSHACK-PSHACK-FINACK-FINACK-ACK remains intact
+			// In theory this does not completely prevent the described from happening only reducing its probability
+			// which might be good enough, to do this more properly we would have to either ensure that every initial SEQ-num is
+			// followed by a blank space of number that can not be taken by other connections on that port
+			// basically we would need to divide the seq-num space into smaller blocks which are each like 64 bits apart
+			if !(last_data_item.flags.PSH && last_data_item.flags.ACK) {
+				log.Println("missing PSH-ACK, dropping")
+				// to do this properly in theory, we would also need to send a FIN-ACK back to the server here,
+				// because the connection we once established still remains intact and the remote server is asking to terminate it
+				send_ack_pos_fin(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack, true)
+				// TODO now we could check if the correct key ACK-(1+DNS_PAYLOAD_SIZE) exists and remove that one from the dictionary
+				return
+			}
 			log.Println("ACKing FIN-ACK")
-			send_ack_pos_fin(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack, false)
+			send_ack_pos_fin(root_data_item.ip, tcp.DstPort, tcp.Seq, tcp.Ack, false)
 			write_chan <- root_data_item
 		}
 	} else
 	// PSH-ACK == DNS Response
 	if tcp.PSH && tcp.ACK {
+		// TODO there is the case where some dns servers tend to respond to the initial query
+		// only after a very long time (more than 120 seconds)
+		// meanwhile they send keep-alive packets (with what seems like exponentially increasing delay)
+		// I'm not yet sure if we should handle this case
+		// this would mean updating the timeout to not trigger the keys removal from the map
+		// if we dont handle this case though, maybe we should sent out FIN-ACKs which we would have to respond to with an ACK
+		// which is a bit difficult as we dont really know if the receiving FIN-ACKs are in response to ours or self-initiated (or just RSTs)
+		// if we dont terminate the connection it might interfere with another newly established connection
+
 		log.Println("received PSH-ACK")
 		// decode as DNS Packet
 		dns := &layers.DNS{}
 		// remove the first two bytes of the payload, i.e. size of the dns response
 		// see build_ack_with_dns()
-		// FIXME
 		if len(tcp.LayerPayload()) <= 2 {
 			return
 		}
@@ -407,6 +435,10 @@ func handle_pkt(pkt gopacket.Packet) {
 			log.Println("already received PSH-ACK")
 			return
 		}
+		if !(last_data_item.flags.SYN && last_data_item.flags.ACK) {
+			log.Println("missing SYN-ACK")
+			return
+		}
 		answers := dns.Answers
 		var answers_ip []net.IP
 		for _, answer := range answers {
@@ -436,7 +468,7 @@ func handle_pkt(pkt gopacket.Packet) {
 		}
 		last_data_item.Next = &data
 		// send FIN-ACK to server
-		send_ack_pos_fin(ip.SrcIP, tcp.DstPort, tcp.Seq, tcp.Ack, true)
+		send_ack_pos_fin(root_data_item.ip, tcp.DstPort, tcp.Seq, tcp.Ack, true)
 	}
 }
 
