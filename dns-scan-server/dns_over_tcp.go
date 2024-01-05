@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/csv"
 	"fmt"
@@ -59,6 +58,21 @@ var DNS_PAYLOAD_SIZE uint16
 
 var waiting_to_end = false
 
+type synced_counter struct {
+	mu    sync.Mutex
+	count uint32
+}
+
+/*
+*	(seq-num)		(Ports from 61440)   	(2048 byte padding)
+*	2^32	*			2^11			/			 2^11		=2^32
+*
+*	increment: |y=11*x | z=21*x|
+*	seq_num = z*2^11, max:2^32-2^11
+*	port = y+15<<15 = y+61440
+ */
+var seq_port_counter synced_counter = synced_counter{count: 0}
+
 // this struct contains all relevant data to track the tcp connection
 type scan_data_item struct {
 	id       uint64
@@ -94,12 +108,6 @@ type root_scan_data struct {
 
 var scan_data root_scan_data = root_scan_data{
 	items: make(map[scan_item_key]*scan_data_item),
-}
-
-// check whether a map entry with the provided sequence number and tcp port already exists
-func (cur_scan_data *root_scan_data) contains(port layers.TCPPort, seq uint32) bool {
-	_, ok := cur_scan_data.items[scan_item_key{port, seq}]
-	return ok
 }
 
 var write_chan = make(chan *scan_data_item, 4096)
@@ -365,16 +373,6 @@ func handle_pkt(pkt gopacket.Packet) {
 			}
 
 			last_data_item := root_data_item.last()
-			// There is the case where after we send a PSH-ACK with the DNS-query the target server
-			// replies with a FIN-ACK without providing an answer to the query
-			// this FIN-ACK could trigger the ACKing and writeout of a completely different connections,
-			// because now the ACK-num which is 1+DNS_PAYLOAD_SIZE higher than the origianl SEQ-num
-			// is reversely wronly identified as a different connection
-			// that is why we check here that the correct structure of SYN-SYNACK-PSHACK-PSHACK-FINACK-FINACK-ACK remains intact
-			// In theory this does not completely prevent the described from happening only reducing its probability
-			// which might be good enough, to do this more properly we would have to ensure that every initial SEQ-num is
-			// followed by a blank space of numbers that can not be taken by other connections on that port
-			// basically we would need to divide the seq-num space into smaller blocks which are each like 64 byte apart
 			if !(last_data_item.flags.PSH && last_data_item.flags.ACK) {
 				log.Println("missing PSH-ACK, dropping")
 				// to do this properly in theory, we would also need to send a FIN-ACK back to the server here,
@@ -488,18 +486,16 @@ func packet_capture(handle *pcapgo.EthernetHandle) {
 	}
 }
 
-func send_syn(id uint64, dst_ip net.IP, port layers.TCPPort) {
-	ip_hash := sha256.New()
-	ip_hash.Write([]byte(dst_ip))
-	hash_sum := ip_hash.Sum(nil)
-	// generate sequence number based on first two bytes of ip hash
-	seq := uint32(hash_sum[0]) + uint32(hash_sum[1])<<8
+func send_syn(id uint64, dst_ip net.IP) {
+	// generate sequence number based on the first 21 bits of the hash
+	seq_port_counter.mu.Lock()
+	seq := (seq_port_counter.count & 0x1FFFFF) * 2048
+	port := layers.TCPPort(((seq_port_counter.count & 0xFFE00000) >> 21) + 61440)
+	seq_port_counter.count += 1
+	seq_port_counter.mu.Unlock()
 	log.Println(dst_ip, "seq_num=", seq)
 	// check for sequence number collisions
 	scan_data.mu.Lock()
-	for scan_data.contains(port, seq) {
-		seq += 420
-	}
 	s_d_item := scan_data_item{
 		id:   id,
 		ts:   time.Now(),
@@ -564,16 +560,14 @@ func get_next_id() uint64 {
 
 func init_tcp(port_min uint16, port_max uint16) {
 	defer wg.Done()
-	// choose a random port in the provided range
-	port := layers.TCPPort(rand.Intn(int(port_max)-int(port_min)) + int(port_min))
 	for {
 		select {
 		case dst_ip := <-ip_chan:
 			// skip bogon ips
 			if is_bogon, _ := bogon.Is(dst_ip.String()); !is_bogon {
 				id := get_next_id()
-				log.Println("ip:", dst_ip, id, port)
-				send_syn(id, dst_ip, port)
+				log.Println("ip:", dst_ip, id)
+				send_syn(id, dst_ip)
 			} else {
 				log.Println("skipping bogon ip:", dst_ip)
 			}
