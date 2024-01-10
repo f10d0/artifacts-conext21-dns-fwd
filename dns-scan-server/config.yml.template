@@ -2,5 +2,4 @@ iface_name: <iface>
 iface_ip: <ip>
 dst_port: 53
 dns_query: rr-mirror.research.nawrocki.berlin
-port_min: 61000
-port_max: 62000
+exclude_ip_fname: exclude_ips.txt

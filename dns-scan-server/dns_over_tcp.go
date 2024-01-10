@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -30,17 +32,18 @@ import (
 )
 
 const (
-	debug = false
+	debug = true
 )
 
 // config
 type cfg_db struct {
-	Iface_name string `yaml:"iface_name"`
-	Iface_ip   string `yaml:"iface_ip"`
-	Dst_port   uint16 `yaml:"dst_port"`
-	Port_min   uint16 `yaml:"port_min"`
-	Port_max   uint16 `yaml:"port_max"`
-	Dns_query  string `yaml:"dns_query"`
+	Iface_name     string `yaml:"iface_name"`
+	Iface_ip       string `yaml:"iface_ip"`
+	Dst_port       uint16 `yaml:"dst_port"`
+	Port_min       uint16 `yaml:"port_min"`
+	Port_max       uint16 `yaml:"port_max"`
+	Dns_query      string `yaml:"dns_query"`
+	Excl_ips_fname string `yaml:"exclude_ips_fname"`
 }
 
 var cfg cfg_db
@@ -149,13 +152,17 @@ func scan_item_to_strarr(scan_item *scan_data_item) []string {
 
 func write_results() {
 	defer wg.Done()
-	csvfile, err := os.Create("tcp_results.csv")
+	ts_date := time.Now().Format("2006-01-02")
+	csvfile, err := os.Create("tcp_results_" + ts_date + ".csv.gz")
 	if err != nil {
 		panic(err)
 	}
 	defer csvfile.Close()
 
-	writer := csv.NewWriter(csvfile)
+	zip_writer := gzip.NewWriter(csvfile)
+	defer zip_writer.Flush()
+
+	writer := csv.NewWriter(zip_writer)
 	writer.Comma = ';'
 	defer writer.Flush()
 
@@ -729,10 +736,37 @@ func gen_ips(netip net.IP, hostsize int) {
 	close(stop_chan)
 }
 
+func exclude_ips() {
+	if _, err := os.Stat(cfg.Excl_ips_fname); errors.Is(err, os.ErrNotExist) {
+		if debug {
+			log.Println("ip exclusion list not found, skipping")
+		}
+		return
+	}
+	file, err := os.Open(cfg.Excl_ips_fname)
+	if err != nil {
+		panic(err)
+	}
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		bogon.New([]string{})
+		if debug {
+			log.Println("added bogon", line)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		panic(err)
+	}
+}
+
 func main() {
 	// write start ts to log
 	write_to_log("START " + time.Now().UTC().String())
-
 	// command line args
 	if len(os.Args) < 1 {
 		write_to_log("END " + time.Now().UTC().String() + " arg not given")
@@ -782,6 +816,7 @@ func main() {
 	}()
 
 	load_config()
+	exclude_ips()
 	// set the DNS_PAYLOAD_SIZE once as it is static
 	_, _, dns_payload := build_ack_with_dns(net.ParseIP("0.0.0.0"), 0, 0, 0)
 	DNS_PAYLOAD_SIZE = uint16(len(dns_payload))
