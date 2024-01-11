@@ -56,9 +56,49 @@ type stop struct{}
 var stop_chan = make(chan stop) // (〃・ω・〃)
 var ip_chan = make(chan net.IP, 1024)
 
+var added_bogons []*bogon.Bogon = []*bogon.Bogon{}
+
 // a simple struct for all the tcp flags needed
 type TCP_flags struct {
 	FIN, SYN, RST, PSH, ACK bool
+}
+
+func (flags TCP_flags) equals(tomatch TCP_flags) bool {
+	return flags.FIN == tomatch.FIN &&
+		flags.SYN == tomatch.SYN &&
+		flags.RST == tomatch.RST &&
+		flags.PSH == tomatch.PSH &&
+		flags.ACK == tomatch.ACK
+}
+
+func (flags TCP_flags) is_PSH_ACK() bool {
+	return flags.equals(TCP_flags{
+		FIN: false,
+		SYN: false,
+		RST: false,
+		PSH: true,
+		ACK: true,
+	})
+}
+
+func (flags TCP_flags) is_SYN_ACK() bool {
+	return flags.equals(TCP_flags{
+		FIN: false,
+		SYN: true,
+		RST: false,
+		PSH: false,
+		ACK: true,
+	})
+}
+
+func (flags TCP_flags) is_FIN_ACK() bool {
+	return flags.equals(TCP_flags{
+		FIN: true,
+		SYN: false,
+		RST: false,
+		PSH: false,
+		ACK: true,
+	})
 }
 
 var DNS_PAYLOAD_SIZE uint16
@@ -333,9 +373,16 @@ func handle_pkt(pkt gopacket.Packet) {
 	if !ok { // skip wrong packets
 		return
 	}
+	tcpflags := TCP_flags{
+		PSH: tcp.PSH,
+		FIN: tcp.FIN,
+		SYN: tcp.SYN,
+		RST: tcp.RST,
+		ACK: tcp.ACK,
+	}
 	if pkt.ApplicationLayer() == nil {
 		// SYN-ACK
-		if tcp.SYN && tcp.ACK {
+		if tcpflags.is_SYN_ACK() {
 			if debug {
 				log.Println("received SYN-ACK")
 			}
@@ -370,7 +417,7 @@ func handle_pkt(pkt gopacket.Packet) {
 			send_ack_with_dns(root_data_item.ip, tcp.DstPort, tcp.Seq, tcp.Ack)
 		} else
 		// FIN-ACK
-		if tcp.FIN && tcp.ACK {
+		if tcpflags.is_FIN_ACK() {
 			if debug {
 				log.Println("received FIN-ACK")
 			}
@@ -382,7 +429,7 @@ func handle_pkt(pkt gopacket.Packet) {
 			}
 
 			last_data_item := root_data_item.last()
-			if !(last_data_item.flags.PSH && last_data_item.flags.ACK) {
+			if !(last_data_item.flags.is_PSH_ACK()) {
 				if debug {
 					log.Println("missing PSH-ACK, dropping")
 				}
@@ -400,7 +447,7 @@ func handle_pkt(pkt gopacket.Packet) {
 		}
 	} else
 	// PSH-ACK == DNS Response
-	if tcp.PSH && tcp.ACK {
+	if tcpflags.is_PSH_ACK() {
 		// TODO there is the case where some dns servers tend to respond to the initial query
 		// only after a very long time (more than 120 seconds)
 		// meanwhile they send keep-alive packets (with what seems like exponentially increasing delay)
@@ -448,13 +495,13 @@ func handle_pkt(pkt gopacket.Packet) {
 		}
 		last_data_item := root_data_item.last()
 		// this should not occur, this would be the case if a psh-ack is being received more than once
-		if last_data_item.flags.PSH && last_data_item.flags.ACK {
+		if last_data_item.flags.is_PSH_ACK() {
 			if debug {
 				log.Println("already received PSH-ACK")
 			}
 			return
 		}
-		if !(last_data_item.flags.SYN && last_data_item.flags.ACK) {
+		if !(last_data_item.flags.is_SYN_ACK()) {
 			if debug {
 				log.Println("missing SYN-ACK")
 			}
@@ -596,17 +643,31 @@ func init_tcp(port_min uint16, port_max uint16) {
 		select {
 		case dst_ip := <-ip_chan:
 			// skip bogon ips
-			if is_bogon, _ := bogon.Is(dst_ip.String()); !is_bogon {
-				id := get_next_id()
-				if debug {
-					log.Println("ip:", dst_ip, id)
-				}
-				send_syn(id, dst_ip)
-			} else {
+			if is_bogon, _ := bogon.Is(dst_ip.String()); is_bogon {
 				if debug {
 					log.Println("skipping bogon ip:", dst_ip)
 				}
+				continue
 			}
+			// check additional bogons == excluded ips
+			should_exclude := false
+			for _, custom_bogon := range added_bogons {
+				if is_in, _ := custom_bogon.Is(dst_ip.String()); is_in {
+					should_exclude = true
+					break
+				}
+			}
+			if should_exclude {
+				if debug {
+					log.Println("excluding ip:", dst_ip)
+				}
+				continue
+			}
+			id := get_next_id()
+			if debug {
+				log.Println("ip:", dst_ip, id)
+			}
+			send_syn(id, dst_ip)
 		case <-stop_chan:
 			return
 		}
@@ -623,7 +684,11 @@ func read_ips_file(fname string) {
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		ip_chan <- net.ParseIP(scanner.Text())
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		ip_chan <- net.ParseIP(line)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -753,7 +818,11 @@ func exclude_ips() {
 		if line == "" {
 			continue
 		}
-		bogon.New([]string{})
+		new_bogon, err := bogon.New([]string{line})
+		if err != nil {
+			panic(err)
+		}
+		added_bogons = append(added_bogons, new_bogon)
 		if debug {
 			log.Println("added bogon", line)
 		}
@@ -765,6 +834,9 @@ func exclude_ips() {
 }
 
 func main() {
+	// TODO run iptables command so that kernel doesnt send out RSTs
+	// sudo iptables -C OUTPUT -p tcp --tcp-flags RST RST -j DROP > /dev/null || sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP
+
 	// write start ts to log
 	write_to_log("START " + time.Now().UTC().String())
 	// command line args
