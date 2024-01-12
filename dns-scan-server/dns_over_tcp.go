@@ -101,6 +101,16 @@ func (flags TCP_flags) is_FIN_ACK() bool {
 	})
 }
 
+func (flags TCP_flags) is_FIN_PSH_ACK() bool {
+	return flags.equals(TCP_flags{
+		FIN: true,
+		SYN: false,
+		RST: false,
+		PSH: true,
+		ACK: true,
+	})
+}
+
 var DNS_PAYLOAD_SIZE uint16
 
 var waiting_to_end = false
@@ -446,8 +456,8 @@ func handle_pkt(pkt gopacket.Packet) {
 			write_chan <- root_data_item
 		}
 	} else
-	// PSH-ACK == DNS Response
-	if tcpflags.is_PSH_ACK() {
+	// PSH-ACK || FIN-PSH-ACK == DNS Response
+	if tcpflags.is_PSH_ACK() || tcpflags.is_FIN_PSH_ACK() {
 		// TODO there is the case where some dns servers tend to respond to the initial query
 		// only after a very long time (more than 120 seconds)
 		// meanwhile they send keep-alive packets (with what seems like exponentially increasing delay)
@@ -458,13 +468,14 @@ func handle_pkt(pkt gopacket.Packet) {
 		// if we dont terminate the connection it might interfere with another newly established connection
 
 		if debug {
-			log.Println("received PSH-ACK")
+			log.Println("received PSH-ACK or FIN-PSH-ACK")
 		}
 		// decode as DNS Packet
 		dns := &layers.DNS{}
 		// remove the first two bytes of the payload, i.e. size of the dns response
 		// see build_ack_with_dns()
 		if len(tcp.LayerPayload()) <= 2 {
+			//TODO this could be the point where we handle the keep-alive pkt
 			return
 		}
 		// validate payload size
@@ -541,6 +552,11 @@ func handle_pkt(pkt gopacket.Packet) {
 		last_data_item.Next = &data
 		// send FIN-ACK to server
 		send_ack_pos_fin(root_data_item.ip, tcp.DstPort, tcp.Seq, tcp.Ack, true)
+		// if this pkt is fin-psh-ack we will remove it from the map at this point already
+		// because we wont receive any further fin-ack from the server
+		if tcpflags.is_FIN_PSH_ACK() {
+			write_chan <- root_data_item
+		}
 	}
 }
 
