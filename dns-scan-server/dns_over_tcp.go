@@ -202,8 +202,7 @@ func scan_item_to_strarr(scan_item *scan_data_item) []string {
 
 func write_results() {
 	defer wg.Done()
-	ts_date := time.Now().Format("2006-01-02")
-	csvfile, err := os.Create("tcp_results_" + ts_date + ".csv.gz")
+	csvfile, err := os.Create("tcp_results.csv.gz")
 	if err != nil {
 		panic(err)
 	}
