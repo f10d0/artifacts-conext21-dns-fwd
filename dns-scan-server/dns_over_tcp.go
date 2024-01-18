@@ -27,8 +27,6 @@ import (
 	"golang.org/x/net/ipv4"
 
 	"github.com/breml/bpfutils"
-
-	"github.com/lrstanley/go-bogon"
 )
 
 const (
@@ -56,7 +54,7 @@ type stop struct{}
 var stop_chan = make(chan stop) // (〃・ω・〃)
 var ip_chan = make(chan net.IP, 1024)
 
-var added_bogons []*bogon.Bogon = []*bogon.Bogon{}
+var blocked_nets []*net.IPNet = []*net.IPNet{}
 
 // a simple struct for all the tcp flags needed
 type TCP_flags struct {
@@ -363,8 +361,6 @@ func send_ack_pos_fin(dst_ip net.IP, src_port layers.TCPPort, seq_num uint32, ac
 }
 
 func handle_pkt(pkt gopacket.Packet) {
-	//log.Println(pkt)
-
 	ip_layer := pkt.Layer(layers.LayerTypeIPv4)
 	if ip_layer == nil {
 		return
@@ -657,17 +653,10 @@ func init_tcp(port_min uint16, port_max uint16) {
 	for {
 		select {
 		case dst_ip := <-ip_chan:
-			// skip bogon ips
-			if is_bogon, _ := bogon.Is(dst_ip.String()); is_bogon {
-				if debug {
-					log.Println("skipping bogon ip:", dst_ip)
-				}
-				continue
-			}
-			// check additional bogons == excluded ips
+			// check for if ip is excluded in the blocklist
 			should_exclude := false
-			for _, custom_bogon := range added_bogons {
-				if is_in, _ := custom_bogon.Is(dst_ip.String()); is_in {
+			for _, blocked_net := range blocked_nets {
+				if blocked_net.Contains(dst_ip) {
 					should_exclude = true
 					break
 				}
@@ -833,13 +822,22 @@ func exclude_ips() {
 		if line == "" {
 			continue
 		}
-		new_bogon, err := bogon.New([]string{line})
+		comment_pos := strings.IndexByte(line, '#')
+		if comment_pos == -1 {
+			comment_pos = len(line)
+		}
+		pos_net := line[:comment_pos]
+		pos_net = strings.TrimSpace(pos_net)
+		if pos_net == "" {
+			continue
+		}
+		_, new_net, err := net.ParseCIDR(pos_net)
 		if err != nil {
 			panic(err)
 		}
-		added_bogons = append(added_bogons, new_bogon)
+		blocked_nets = append(blocked_nets, new_net)
 		if debug {
-			log.Println("added bogon", line)
+			log.Println("added blocked net:", new_net.String())
 		}
 	}
 
