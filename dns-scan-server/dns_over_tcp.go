@@ -207,7 +207,7 @@ func write_results() {
 	defer csvfile.Close()
 
 	zip_writer := gzip.NewWriter(csvfile)
-	defer zip_writer.Flush()
+	defer zip_writer.Close()
 
 	writer := csv.NewWriter(zip_writer)
 	writer.Comma = ';'
