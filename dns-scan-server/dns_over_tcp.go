@@ -809,6 +809,7 @@ func exclude_ips() {
 	if _, err := os.Stat(cfg.Excl_ips_fname); errors.Is(err, os.ErrNotExist) {
 		if debug {
 			log.Println("ip exclusion list not found, skipping")
+			log.Println("exclusion list filename was read as:", cfg.Excl_ips_fname)
 		}
 		return
 	}
@@ -832,9 +833,16 @@ func exclude_ips() {
 			continue
 		}
 		_, new_net, err := net.ParseCIDR(pos_net)
-		if err != nil {
-			panic(err)
+		if err != nil { // if there are errors try if the string maybe is a single ip
+			toblock_ip := net.ParseIP(pos_net)
+			if toblock_ip == nil {
+				log.Println("could not interpret line, skipping")
+				continue
+			}
+			mask := net.CIDRMask(32, 32) // 32 bits for IPv4
+			new_net = &net.IPNet{IP: toblock_ip, Mask: mask}
 		}
+
 		blocked_nets = append(blocked_nets, new_net)
 		if debug {
 			log.Println("added blocked net:", new_net.String())
